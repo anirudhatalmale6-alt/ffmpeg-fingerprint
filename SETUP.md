@@ -41,23 +41,35 @@ ffmpeg -i "SOURCE_URL" \
   -c:a copy -f mpegts pipe:1
 ```
 
-**NEW command (zero re-encoding, zero CPU):**
+**NEW command (zero re-encoding, zero CPU, fully automatic):**
+
+Auto-cycle mode (show 5min, hide 10min, repeat):
 ```bash
 ffmpeg -hide_banner -loglevel error \
   -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
   -user_agent "Mozilla/5.0" \
   -i "SOURCE_URL" \
   -c:v copy -c:a copy \
-  -bsf:v fingerprint_inject=zmq_addr=tcp\://127.0.0.1\:5555 \
+  -bsf:v fingerprint_inject=text='USERNAME':show_duration=300:hide_duration=600 \
   -map 0:v:0? -map 0:a:0? \
   -f mpegts -mpegts_copyts 1 pipe:1
 ```
 
-Key differences:
+Always-on mode (fingerprint always visible):
+```bash
+ffmpeg -i "SOURCE_URL" -c:v copy -c:a copy \
+  -bsf:v fingerprint_inject=text='USERNAME' \
+  -f mpegts pipe:1
+```
+
+Your backend just replaces USERNAME with the actual username from DB. One command per viewer. No Python trigger needed.
+
+Key differences from old command:
 - `-c:v copy` instead of `-c:v libx264` (no video encoding!)
-- `-bsf:v fingerprint_inject=...` instead of `-vf "zmq,drawtext=..."`
+- `-bsf:v fingerprint_inject=text=USERNAME` instead of `-vf "zmq,drawtext=text='USERNAME'"`
 - No `-preset`, `-tune`, `-crf` needed (nothing to encode)
-- Same ZMQ address, same pipe output
+- show_duration/hide_duration handles timing automatically (no Python sleep)
+- Random position changes happen automatically at each show cycle
 
 Works with ALL output formats:
 ```bash
@@ -140,29 +152,35 @@ if __name__ == "__main__":
 
 ## 4. How to Test Your Integration
 
-1. Start the stream with the NEW FFmpeg command (copy codecs + BSF):
+1. Start the stream with ONE command (username from DB, fully automatic):
    ```bash
    ffmpeg -i "SOURCE_URL" -c:v copy -c:a copy \
-     -bsf:v fingerprint_inject=zmq_addr=tcp\://127.0.0.1\:5555 \
+     -bsf:v fingerprint_inject=text='TEST_USER_123':show_duration=300:hide_duration=600 \
      -f mpegts pipe:1 > output.ts
    ```
+   That's it. No Python trigger needed. The fingerprint:
+   - Shows "TEST_USER_123" immediately
+   - Shows for 300 seconds (5 minutes)
+   - Hides for 600 seconds (10 minutes)
+   - Shows again with a new random position
+   - Repeats forever
 
-2. In another terminal, trigger the fingerprint (same as before):
-   ```bash
-   python3 db_trigger.py "TEST_USER_123" 300
-   ```
+2. The stream does NOT re-encode! Zero CPU usage for video processing.
 
-3. The fingerprint data is now embedded in the H.264/H.265 stream as SEI data.
-   The stream does NOT re-encode! Zero CPU usage for video processing.
-
-4. Run the trigger again with a different user - it updates instantly via ZMQ.
-
-5. After 300 seconds, the fingerprint automatically hides.
-
-6. To verify the fingerprint was injected, use the sei_reader tool:
+3. To verify the fingerprint was injected, use the sei_reader tool:
    ```bash
    ffmpeg -i output.ts -c:v copy -f h264 pipe:1 | ./bin/sei_reader
    # Output: [FINGERPRINT #1] TEST_USER_123
+   ```
+
+4. Your backend integration:
+   ```python
+   # In your backend, just build the FFmpeg command with the username:
+   username = fetch_username_from_db(user_id)
+   cmd = f'ffmpeg -i "{source_url}" -c:v copy -c:a copy ' \
+         f'-bsf:v fingerprint_inject=text={username}:show_duration=300:hide_duration=600 ' \
+         f'-f mpegts pipe:1'
+   subprocess.Popen(cmd, shell=True)
    ```
 
 ---

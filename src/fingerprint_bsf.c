@@ -7,10 +7,27 @@
  * For H.264: Injects SEI type 5 (user_data_unregistered) before keyframes
  * For H.265: Injects PREFIX_SEI_NUT (type 39) before keyframes
  *
- * Dynamic control via ZeroMQ: send text updates in real-time.
+ * Automatic mode (single command, no Python trigger needed):
+ *   ffmpeg -i input -c:v copy -c:a copy \
+ *     -bsf:v fingerprint_inject=text=USERNAME:show_duration=300:hide_duration=600 \
+ *     -f mpegts output
  *
- * Usage:
- *   ffmpeg -i input -c:v copy -bsf:v fingerprint_inject=zmq_addr=tcp\\://127.0.0.1\\:5555 -f mpegts output
+ * Always-on mode (fingerprint always visible):
+ *   ffmpeg -i input -c:v copy -c:a copy \
+ *     -bsf:v fingerprint_inject=text=USERNAME \
+ *     -f mpegts output
+ *
+ * ZMQ dynamic mode (controlled by external script):
+ *   ffmpeg -i input -c:v copy -c:a copy \
+ *     -bsf:v fingerprint_inject=zmq_addr=tcp\\://127.0.0.1\\:5555 \
+ *     -f mpegts output
+ *
+ * Options:
+ *   text=STRING          Username/fingerprint text (auto-fetched from your DB)
+ *   show_duration=N      Show for N seconds, then hide (0=always on)
+ *   hide_duration=N      Hide for N seconds between shows (0=never hide)
+ *   zmq_addr=ADDR        Optional ZMQ for external control
+ *   inject_interval=N    Inject every N keyframes (0=every keyframe)
  *
  * Copyright (c) 2026 - Custom FFmpeg Plugin
  */
@@ -75,11 +92,19 @@ typedef struct FingerprintBSFContext {
     char *zmq_addr;
     char *initial_text;
     int   inject_interval;  /* inject every N keyframes (0 = every keyframe) */
+    int   show_duration;    /* how long to show fingerprint (seconds), 0=always */
+    int   hide_duration;    /* how long to hide between shows (seconds), 0=never hide */
+    int   auto_cycle;       /* 1=auto show/hide cycle, 0=manual/always-on */
 
     /* Runtime state */
     char fingerprint_text[MAX_FINGERPRINT_LEN];
     int  text_active;       /* whether fingerprint is currently active */
     int  keyframe_count;
+    int64_t first_pts;      /* PTS of first packet (for timing) */
+    int64_t cycle_start_pts;/* PTS when current show/hide cycle started */
+    int  cycle_showing;     /* 1=currently in "show" phase, 0=in "hide" phase */
+    int  position_index;    /* current position (0-8), -1=random each cycle */
+    int  pts_initialized;
 
     /* ZMQ */
     void *zmq_ctx;
@@ -535,11 +560,29 @@ static int fingerprint_bsf_init(AVBSFContext *bsf)
     ctx->text_active = 0;
     ctx->fingerprint_text[0] = '\0';
     ctx->keyframe_count = 0;
+    ctx->first_pts = AV_NOPTS_VALUE;
+    ctx->cycle_start_pts = 0;
+    ctx->cycle_showing = 0;
+    ctx->pts_initialized = 0;
+    ctx->position_index = -1;
 
     if (ctx->initial_text && ctx->initial_text[0]) {
         strncpy(ctx->fingerprint_text, ctx->initial_text, MAX_FINGERPRINT_LEN - 1);
         ctx->fingerprint_text[MAX_FINGERPRINT_LEN - 1] = '\0';
         ctx->text_active = 1;
+
+        /* Auto-cycle mode: if show_duration or hide_duration set */
+        if (ctx->show_duration > 0 || ctx->hide_duration > 0) {
+            ctx->auto_cycle = 1;
+            ctx->cycle_showing = 1; /* start in "show" phase */
+            av_log(bsf, AV_LOG_INFO,
+                   "fingerprint_inject: auto-cycle mode: show=%ds hide=%ds\n",
+                   ctx->show_duration, ctx->hide_duration);
+        }
+
+        av_log(bsf, AV_LOG_INFO,
+               "fingerprint_inject: text='%s' active=%d\n",
+               ctx->fingerprint_text, ctx->text_active);
     }
 
     /* Initialize ZMQ if address provided */
@@ -626,6 +669,51 @@ static int fingerprint_bsf_filter(AVBSFContext *bsf, AVPacket *pkt)
 
     ctx->keyframe_count++;
 
+    /* Initialize PTS tracking */
+    if (!ctx->pts_initialized && pkt->pts != AV_NOPTS_VALUE) {
+        ctx->first_pts = pkt->pts;
+        ctx->cycle_start_pts = pkt->pts;
+        ctx->pts_initialized = 1;
+    }
+
+    /* Auto-cycle: compute show/hide state based on PTS timing */
+    if (ctx->auto_cycle && ctx->pts_initialized && pkt->pts != AV_NOPTS_VALUE) {
+        /* Assume 90kHz PTS timebase (standard for MPEG-TS) */
+        int64_t elapsed_ticks = pkt->pts - ctx->cycle_start_pts;
+        double elapsed_sec = (double)elapsed_ticks / 90000.0;
+
+        if (ctx->cycle_showing) {
+            /* Currently showing - check if show_duration has passed */
+            if (ctx->show_duration > 0 && elapsed_sec >= ctx->show_duration) {
+                if (ctx->hide_duration > 0) {
+                    /* Transition to hide phase */
+                    ctx->cycle_showing = 0;
+                    ctx->cycle_start_pts = pkt->pts;
+                    av_log(bsf, AV_LOG_INFO,
+                           "fingerprint_inject: auto-hide (showed for %ds)\n",
+                           ctx->show_duration);
+                } else {
+                    /* No hide duration - pick new random position, restart show */
+                    ctx->cycle_start_pts = pkt->pts;
+                    ctx->position_index = -1; /* will re-randomize */
+                    av_log(bsf, AV_LOG_INFO,
+                           "fingerprint_inject: repositioning\n");
+                }
+            }
+        } else {
+            /* Currently hidden - check if hide_duration has passed */
+            if (ctx->hide_duration > 0 && elapsed_sec >= ctx->hide_duration) {
+                /* Transition to show phase with new random position */
+                ctx->cycle_showing = 1;
+                ctx->cycle_start_pts = pkt->pts;
+                ctx->position_index = -1; /* new random position */
+                av_log(bsf, AV_LOG_INFO,
+                       "fingerprint_inject: auto-show (hidden for %ds)\n",
+                       ctx->hide_duration);
+            }
+        }
+    }
+
     /* Check interval */
     if (ctx->inject_interval > 0 &&
         (ctx->keyframe_count % ctx->inject_interval) != 1)
@@ -638,6 +726,10 @@ static int fingerprint_bsf_filter(AVBSFContext *bsf, AVPacket *pkt)
     if (active)
         strncpy(text, ctx->fingerprint_text, MAX_FINGERPRINT_LEN);
     pthread_mutex_unlock(&ctx->text_mutex);
+
+    /* In auto-cycle mode, respect the show/hide state */
+    if (ctx->auto_cycle && !ctx->cycle_showing)
+        active = 0;
 
     if (!active || text[0] == '\0')
         return 0; /* no fingerprint to inject */
@@ -769,8 +861,12 @@ static void fingerprint_bsf_close(AVBSFContext *bsf)
 static const AVOption fingerprint_options[] = {
     { "zmq_addr", "ZeroMQ bind address for dynamic control",
       OFFSET(zmq_addr), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS },
-    { "text", "Initial fingerprint text (static mode)",
+    { "text", "Fingerprint text (username from DB)",
       OFFSET(initial_text), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS },
+    { "show_duration", "Show fingerprint for N seconds (0=always visible)",
+      OFFSET(show_duration), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 86400, FLAGS },
+    { "hide_duration", "Hide fingerprint for N seconds between shows (0=never hide)",
+      OFFSET(hide_duration), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 86400, FLAGS },
     { "inject_interval", "Inject every N keyframes (0=every keyframe)",
       OFFSET(inject_interval), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1000, FLAGS },
     { NULL }
