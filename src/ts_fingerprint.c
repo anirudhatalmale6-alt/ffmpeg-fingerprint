@@ -268,95 +268,87 @@ static uint8_t *render_text_bitmap(const char *text, int *w, int *h)
 }
 
 /*
- * Encode bitmap as DVB subtitle pixel data using RLE coding.
- * Returns encoded data size, writes to *out_buf (caller frees).
+ * Encode bitmap as DVB subtitle pixel data using 4-bit/pixel RLE coding.
+ * DVB spec EN 300 743, Table 10: 4-bit/pixel code string
  *
- * Uses 2-bit RLE coding (4 colors max).
- * DVB RLE format for 2-bit:
- *   - Non-zero pixel: 2 bits = color index
- *   - Run of same color: special codes
+ * Each line starts with data_type=0x11 (4-bit pixel data)
+ * and ends with end_of_string_signal (0x00).
+ *
+ * Simple encoding: write each pixel as a 4-bit nibble.
+ * For runs of the same color, use run-length codes.
  */
-static int encode_dvb_rle_2bit(const uint8_t *bitmap, int w, int h,
+static int encode_dvb_rle_4bit(const uint8_t *bitmap, int w, int h,
                                 uint8_t **out_buf, int *out_size)
 {
-    /* Estimate max size (worst case: no compression) */
-    int max_size = w * h + h * 4 + 64;
+    /* Estimate max size: each pixel = 4 bits, plus overhead */
+    int max_size = w * h + h * 8 + 256;
     uint8_t *buf = malloc(max_size);
     if (!buf) return -1;
 
     int pos = 0;
-    int bit_pos = 0;
+    int nibble_pos = 0; /* 0 = high nibble, 1 = low nibble */
     uint8_t current_byte = 0;
 
-    #define WRITE_2BITS(val) do { \
-        current_byte |= ((val) & 0x03) << (6 - bit_pos); \
-        bit_pos += 2; \
-        if (bit_pos >= 8) { \
+    #define WRITE_NIBBLE(val) do { \
+        if (nibble_pos == 0) { \
+            current_byte = ((val) & 0x0F) << 4; \
+            nibble_pos = 1; \
+        } else { \
+            current_byte |= (val) & 0x0F; \
             buf[pos++] = current_byte; \
             current_byte = 0; \
-            bit_pos = 0; \
+            nibble_pos = 0; \
         } \
     } while(0)
 
-    #define FLUSH_BYTE() do { \
-        if (bit_pos > 0) { \
+    #define FLUSH_NIBBLE() do { \
+        if (nibble_pos == 1) { \
             buf[pos++] = current_byte; \
             current_byte = 0; \
-            bit_pos = 0; \
+            nibble_pos = 0; \
         } \
     } while(0)
 
     for (int y = 0; y < h; y++) {
-        /* Start of line: data_type = 0x10 (2-bit pixel data) */
-        FLUSH_BYTE();
-        buf[pos++] = 0x10; /* 2-bit/pixel code */
+        /* Start of line: data_type = 0x11 (4-bit pixel data) */
+        FLUSH_NIBBLE();
+        buf[pos++] = 0x11;
 
         const uint8_t *row = bitmap + y * w;
         int x = 0;
 
         while (x < w) {
-            uint8_t pixel = row[x] & 0x03;
+            uint8_t pixel = row[x] & 0x0F;
             int run = 1;
 
             /* Count run length */
-            while (x + run < w && row[x + run] == pixel && run < 284)
+            while (x + run < w && (row[x + run] & 0x0F) == pixel && run < 280)
                 run++;
 
-            if (pixel != 0) {
-                /* Non-zero pixel runs */
-                if (run >= 3 && run <= 10) {
-                    WRITE_2BITS(0); WRITE_2BITS(0); /* escape */
-                    WRITE_2BITS(1); /* run of color */
-                    WRITE_2BITS((run - 3) >> 1);
-                    WRITE_2BITS((run - 3) & 1);
-                    /* Hmm, the 2-bit RLE is complex. Let's simplify */
-                }
-                /* Simple approach: just write individual pixels */
+            if (pixel != 0 && run == 1) {
+                /* Single non-zero pixel: just write the nibble */
+                WRITE_NIBBLE(pixel);
+            } else if (pixel != 0 && run >= 2) {
+                /* Non-zero pixel run: write individual pixels (simple but reliable) */
                 for (int i = 0; i < run; i++)
-                    WRITE_2BITS(pixel);
+                    WRITE_NIBBLE(pixel);
             } else {
-                /* Transparent pixel runs */
-                if (run < 4) {
-                    for (int i = 0; i < run; i++)
-                        WRITE_2BITS(0);
-                } else {
-                    /* Encode as individual zeros (simple but works) */
-                    for (int i = 0; i < run; i++)
-                        WRITE_2BITS(0);
-                }
+                /* Zero (transparent) pixels: write individual zeros */
+                for (int i = 0; i < run; i++)
+                    WRITE_NIBBLE(0);
             }
 
             x += run;
         }
 
-        /* End of line marker: 0x00 0x00 */
-        FLUSH_BYTE();
+        /* End of line: flush nibble then write 0x00 end marker */
+        FLUSH_NIBBLE();
         buf[pos++] = 0x00;
         buf[pos++] = 0x00;
     }
 
-    #undef WRITE_2BITS
-    #undef FLUSH_BYTE
+    #undef WRITE_NIBBLE
+    #undef FLUSH_NIBBLE
 
     *out_buf = buf;
     *out_size = pos;
@@ -397,13 +389,14 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     /* Encode bitmap to RLE */
     uint8_t *rle_data = NULL;
     int rle_size = 0;
-    encode_dvb_rle_2bit(bitmap, bmp_w, bmp_h, &rle_data, &rle_size);
+    encode_dvb_rle_4bit(bitmap, bmp_w, bmp_h, &rle_data, &rle_size);
     free(bitmap);
 
     if (!rle_data) return -1;
 
     /* Build the complete subtitle display set */
-    int max_pes_size = 2 + 256 + rle_size + 256; /* generous estimate */
+    /* Need: headers(~128) + CLUT(~48) + ODS(rle*2 for top+bottom) + margin */
+    int max_pes_size = 256 + rle_size * 2 + 256;
     uint8_t *pes = malloc(max_pes_size);
     if (!pes) { free(rle_data); return -1; }
 
@@ -437,19 +430,22 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     put_be16(pes + p, 0); p += 2;
     int rcs_start = p;
     pes[p++] = region_id; /* region_id */
-    pes[p++] = 0x00; /* region_version(0) + fill_flag(0) */
+    pes[p++] = 0x00; /* region_version_number(4b)=0 + region_fill_flag(1b)=0 + reserved(3b) */
     put_be16(pes + p, bmp_w); p += 2; /* region_width */
     put_be16(pes + p, bmp_h); p += 2; /* region_height */
-    pes[p++] = 0x00; /* region_level_of_compatibility + region_depth (2bit) */
-    pes[p++] = 0x00; /* CLUT_id */
-    pes[p++] = 0x00; /* region_8bit_pixel_code (background) */
-    pes[p++] = 0x00; /* region_4bit + region_2bit pixel codes */
-    /* Object reference */
-    put_be16(pes + p, 0x0000); p += 2; /* object_id */
-    pes[p++] = 0x00; /* object_type(0=bitmap) + provider(0) */
-    pes[p++] = 0x00; /* reserved */
-    put_be16(pes + p, 0); p += 2; /* object_horizontal_position */
-    put_be16(pes + p, 0); p += 2; /* object_vertical_position */
+    /*
+     * region_level_of_compatibility(3b) + region_depth(3b) + reserved(2b)
+     * For 4-bit depth: compatibility=010(4bit), depth=010(4bit) = 0x48
+     */
+    pes[p++] = 0x48;
+    pes[p++] = 0x00; /* CLUT_id = 0 */
+    pes[p++] = 0x00; /* region_8-bit_pixel_code (background) */
+    pes[p++] = 0x00; /* region_4-bit_pixel_code(4b)=0 + region_2-bit_pixel_code(2b)=0 + reserved(2b) */
+    /* Object reference in region */
+    put_be16(pes + p, 0x0000); p += 2; /* object_id = 0 */
+    /* object_type(2b)=00(bitmap) + object_provider_flag(2b)=00 + object_horizontal_position(12b) */
+    put_be16(pes + p, 0x0000); p += 2; /* type=bitmap, h_pos=0 */
+    put_be16(pes + p, 0x0000); p += 2; /* reserved(4b) + object_vertical_position(12b) = 0 */
     put_be16(pes + rcs_len_pos, p - rcs_start);
 
     /* --- CLUT Definition Segment --- */
@@ -459,29 +455,38 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     int cds_len_pos = p;
     put_be16(pes + p, 0); p += 2;
     int cds_start = p;
-    pes[p++] = 0x00; /* CLUT_id */
-    pes[p++] = 0x00; /* CLUT_version_number */
+    pes[p++] = 0x00; /* CLUT_id = 0 */
+    pes[p++] = 0x00; /* CLUT_version_number(4b)=0 + reserved(4b) */
+    /*
+     * CLUT entry flags byte:
+     *   bit 7: 2-bit/entry_CLUT_flag
+     *   bit 6: 4-bit/entry_CLUT_flag
+     *   bit 5: 8-bit/entry_CLUT_flag
+     *   bits 4-1: reserved
+     *   bit 0: full_range_flag (1=Y,Cr,Cb,T each 8 bits)
+     * We use 4-bit CLUT with full range = 0x41
+     */
     /* Entry 0: transparent */
-    pes[p++] = 0x00; /* CLUT_entry_id */
-    pes[p++] = 0x20; /* 2-bit entry flag */
-    pes[p++] = 0x00; /* Y */
-    pes[p++] = 0x00; /* Cr */
-    pes[p++] = 0x00; /* Cb */
-    pes[p++] = 0x00; /* T (fully transparent) */
+    pes[p++] = 0x00; /* CLUT_entry_id = 0 */
+    pes[p++] = 0x41; /* 4-bit CLUT flag + full_range */
+    pes[p++] = 0x00; /* Y = 0 */
+    pes[p++] = 0x80; /* Cr = 128 (neutral) */
+    pes[p++] = 0x80; /* Cb = 128 (neutral) */
+    pes[p++] = 0x00; /* T = 0 (fully transparent) */
     /* Entry 1: white text */
-    pes[p++] = 0x01;
-    pes[p++] = 0x20;
-    pes[p++] = 0xFF; /* Y (white) */
-    pes[p++] = 0x80; /* Cr */
-    pes[p++] = 0x80; /* Cb */
-    pes[p++] = 0xFF; /* T (fully opaque) */
+    pes[p++] = 0x01; /* CLUT_entry_id = 1 */
+    pes[p++] = 0x41; /* 4-bit CLUT flag + full_range */
+    pes[p++] = 0xEB; /* Y = 235 (white in BT.601) */
+    pes[p++] = 0x80; /* Cr = 128 (neutral) */
+    pes[p++] = 0x80; /* Cb = 128 (neutral) */
+    pes[p++] = 0xFF; /* T = 255 (fully opaque) */
     /* Entry 2: semi-transparent black background */
-    pes[p++] = 0x02;
-    pes[p++] = 0x20;
-    pes[p++] = 0x10; /* Y (black) */
-    pes[p++] = 0x80; /* Cr */
-    pes[p++] = 0x80; /* Cb */
-    pes[p++] = 0x80; /* T (semi-transparent) */
+    pes[p++] = 0x02; /* CLUT_entry_id = 2 */
+    pes[p++] = 0x41; /* 4-bit CLUT flag + full_range */
+    pes[p++] = 0x10; /* Y = 16 (black in BT.601) */
+    pes[p++] = 0x80; /* Cr = 128 (neutral) */
+    pes[p++] = 0x80; /* Cb = 128 (neutral) */
+    pes[p++] = 0x80; /* T = 128 (semi-transparent) */
     put_be16(pes + cds_len_pos, p - cds_start);
 
     /* --- Object Data Segment --- */
@@ -491,15 +496,19 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     int ods_len_pos = p;
     put_be16(pes + p, 0); p += 2;
     int ods_start = p;
-    put_be16(pes + p, 0x0000); p += 2; /* object_id */
-    pes[p++] = 0x00; /* object_version + coding_method(0=bitmap) */
-    pes[p++] = 0x00; /* non_modifying_colour_flag */
-    /* Top field data block */
+    put_be16(pes + p, 0x0000); p += 2; /* object_id = 0 */
+    /*
+     * object_version_number(4b) + object_coding_method(2b) + non_modifying_colour_flag(1b) + reserved(1b)
+     * version=0, coding=00(bitmap), non_mod=0
+     */
+    pes[p++] = 0x00;
+    /* Top and bottom field data block lengths */
     put_be16(pes + p, rle_size); p += 2; /* top_field_data_block_length */
-    put_be16(pes + p, rle_size); p += 2; /* bottom_field_data_block_length */
+    put_be16(pes + p, 0); p += 2; /* bottom_field_data_block_length = 0 (progressive, reuse top) */
+    /* Top field pixel data */
     memcpy(pes + p, rle_data, rle_size); p += rle_size;
-    /* Bottom field = same as top for progressive */
-    memcpy(pes + p, rle_data, rle_size); p += rle_size;
+    /* Align to byte boundary if needed */
+    if (p & 1) pes[p++] = 0x00;
     put_be16(pes + ods_len_pos, p - ods_start);
 
     free(rle_data);
@@ -806,51 +815,73 @@ static int build_modified_pmt(uint8_t *out_ts)
     if (has_adaptation) offset = 5 + out_ts[4];
     offset += out_ts[offset] + 1; /* pointer field */
 
+    /* Bounds check */
+    if (offset + 3 >= TS_PACKET_SIZE) return -1;
+
     /* Find section_length */
     int section_length = ((out_ts[offset + 1] & 0x0F) << 8) | out_ts[offset + 2];
     int section_end = offset + 3 + section_length - 4; /* before CRC */
 
-    /* Add subtitle stream entry before CRC */
-    if (section_end + 10 >= TS_PACKET_SIZE) return -1; /* no room */
+    /*
+     * DVB subtitle stream entry we need to add:
+     *   stream_type:     1 byte  (0x06)
+     *   elementary_PID:  2 bytes (with reserved bits)
+     *   ES_info_length:  2 bytes (with reserved bits)
+     *   descriptor 0x59: 2 + 8 = 10 bytes
+     *     tag(1) + length(1) + lang(3) + type(1) + comp_page(2) + anc_page(2)
+     * Total: 5 + 10 = 15 bytes
+     * Plus 4 bytes for CRC after.
+     */
+    int entry_size = 15;
 
-    /* DVB subtitle stream entry: stream_type(0x06) + PID + descriptors */
-    out_ts[section_end] = STREAM_TYPE_DVB_SUB; /* stream_type */
-    out_ts[section_end + 1] = 0xE0 | ((SUBTITLE_PID >> 8) & 0x1F);
-    out_ts[section_end + 2] = SUBTITLE_PID & 0xFF;
+    /* Check if we have room in the TS packet */
+    if (section_end + entry_size + 4 > TS_PACKET_SIZE) {
+        /* Not enough room - skip PMT modification */
+        return -1;
+    }
 
-    /* ES_info: DVB subtitle descriptor */
-    int desc_len = 8; /* subtitle_descriptor */
-    out_ts[section_end + 3] = 0xF0 | ((desc_len >> 8) & 0x0F);
-    out_ts[section_end + 4] = desc_len & 0xFF;
+    int p = section_end;
 
-    /* Subtitle descriptor (tag=0x59) */
-    out_ts[section_end + 5] = 0x59; /* descriptor_tag */
-    out_ts[section_end + 6] = 6;    /* descriptor_length */
-    out_ts[section_end + 7] = 'e';  /* ISO 639 language: "eng" */
-    out_ts[section_end + 8] = 'n';
-    out_ts[section_end + 9] = 'g';
-    out_ts[section_end + 10] = 0x10; /* subtitling_type: DVB normal */
-    put_be16(out_ts + section_end + 11, 1); /* composition_page_id */
-    /* Note: we may exceed our allotted space here, let's adjust */
+    /* stream_type = 0x06 (private data / DVB subtitle) */
+    out_ts[p++] = STREAM_TYPE_DVB_SUB;
 
-    int new_stream_entry_size = 5 + desc_len;
-    int new_section_length = section_length + new_stream_entry_size;
+    /* elementary_PID with reserved bits (3 bits reserved = 111) */
+    out_ts[p++] = 0xE0 | ((SUBTITLE_PID >> 8) & 0x1F);
+    out_ts[p++] = SUBTITLE_PID & 0xFF;
 
-    /* Update section length */
+    /* ES_info_length = 10 (descriptor tag + len + 8 bytes payload) */
+    int es_info_len = 10;
+    out_ts[p++] = 0xF0 | ((es_info_len >> 8) & 0x0F);
+    out_ts[p++] = es_info_len & 0xFF;
+
+    /* DVB Subtitle descriptor (tag=0x59) */
+    out_ts[p++] = 0x59;  /* descriptor_tag */
+    out_ts[p++] = 8;     /* descriptor_length (8 bytes of payload) */
+    out_ts[p++] = 'e';   /* ISO 639 language code: "eng" */
+    out_ts[p++] = 'n';
+    out_ts[p++] = 'g';
+    out_ts[p++] = 0x10;  /* subtitling_type: normal DVB */
+    out_ts[p++] = 0x00;  /* composition_page_id high */
+    out_ts[p++] = 0x01;  /* composition_page_id low */
+    out_ts[p++] = 0x00;  /* ancillary_page_id high */
+    out_ts[p++] = 0x01;  /* ancillary_page_id low */
+
+    /* Update section_length */
+    int new_section_length = section_length + entry_size;
     out_ts[offset + 1] = 0xB0 | ((new_section_length >> 8) & 0x0F);
     out_ts[offset + 2] = new_section_length & 0xFF;
 
     /* Recalculate CRC32 */
-    int new_section_end = offset + 3 + new_section_length - 4;
-    int crc_data_len = new_section_end - offset;
+    int crc_pos = p;
+    int crc_data_len = crc_pos - offset;
     uint32_t crc = calc_crc32(out_ts + offset, crc_data_len);
-    out_ts[new_section_end] = (crc >> 24) & 0xFF;
-    out_ts[new_section_end + 1] = (crc >> 16) & 0xFF;
-    out_ts[new_section_end + 2] = (crc >> 8) & 0xFF;
-    out_ts[new_section_end + 3] = crc & 0xFF;
+    out_ts[crc_pos++] = (crc >> 24) & 0xFF;
+    out_ts[crc_pos++] = (crc >> 16) & 0xFF;
+    out_ts[crc_pos++] = (crc >> 8) & 0xFF;
+    out_ts[crc_pos++] = crc & 0xFF;
 
     /* Fill remainder with 0xFF (stuffing) */
-    for (int i = new_section_end + 4; i < TS_PACKET_SIZE; i++)
+    for (int i = crc_pos; i < TS_PACKET_SIZE; i++)
         out_ts[i] = 0xFF;
 
     /* Update continuity counter */

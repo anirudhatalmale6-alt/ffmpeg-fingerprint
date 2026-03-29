@@ -3,3 +3,9 @@ build/
 ffmpeg-build/
 ffmpeg-dist/
 *.o
+demo/test_input.ts
+demo/output_subtitle.ts
+demo/short_*
+demo/*.log
+demo/frame_*
+demo/demo_rendered.mp4
