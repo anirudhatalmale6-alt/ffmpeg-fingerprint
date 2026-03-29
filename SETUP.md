@@ -94,59 +94,56 @@ Works with ALL output formats:
 
 ---
 
-## 3. The Backend Python Trigger (Drop-in Replacement)
+## 3. Multiple Streams (Different ZMQ Ports)
+
+Each stream needs its own ZMQ port. Your backend assigns a unique port per stream:
+
+```bash
+# Stream 1 (port 5555)
+ffmpeg -i "SOURCE_1" -c:v copy -c:a copy \
+  -bsf:v fingerprint_inject=zmq_addr=tcp\\://127.0.0.1\\:5555 \
+  -f mpegts pipe:1
+
+# Stream 2 (port 5556)
+ffmpeg -i "SOURCE_2" -c:v copy -c:a copy \
+  -bsf:v fingerprint_inject=zmq_addr=tcp\\://127.0.0.1\\:5556 \
+  -f mpegts pipe:1
+
+# Stream 3 (port 5557)
+ffmpeg -i "SOURCE_3" -c:v copy -c:a copy \
+  -bsf:v fingerprint_inject=zmq_addr=tcp\\://127.0.0.1\\:5557 \
+  -f mpegts pipe:1
+```
+
+Trigger fingerprint on specific stream:
+```bash
+# Fingerprint on Stream 1
+python3 db_trigger.py "USERNAME" 300 tcp://127.0.0.1:5555
+
+# Fingerprint on Stream 2
+python3 db_trigger.py "USERNAME" 300 tcp://127.0.0.1:5556
+```
+
+---
+
+## 4. The Backend Python Trigger (Drop-in Replacement)
 
 Same usage as the original `db_trigger.py`:
 
-```python
-import zmq
-import random
-import sys
-import time
+```bash
+# Single stream (default port 5555)
+python3 db_trigger.py "USERNAME" 300
 
-# --- CONFIGURATION ---
-ZMQ_ADDRESS = "tcp://127.0.0.1:5555"
-
-POSITIONS = {
-    "top_left": 0, "top_center": 1, "top_right": 2,
-    "mid_left": 3, "center": 4, "mid_right": 5,
-    "bottom_left": 6, "bottom_center": 7, "bottom_right": 8,
-}
-
-def trigger_ffmpeg_zmq(text, duration_sec):
-    # 1. Pick a random position
-    pos_name = random.choice(list(POSITIONS.keys()))
-
-    context = zmq.Context()
-    socket = context.socket(zmq.REQ)
-    socket.setsockopt(zmq.RCVTIMEO, 5000)
-    socket.setsockopt(zmq.SNDTIMEO, 5000)
-    socket.connect(ZMQ_ADDRESS)
-
-    # --- SHOW FINGERPRINT ---
-    show_cmd = f"SHOW {text}"
-    print(f"Showing [{pos_name}] for {duration_sec}s for user: {text}")
-    socket.send_string(show_cmd)
-    socket.recv_string()
-
-    time.sleep(duration_sec)
-
-    # --- HIDE FINGERPRINT ---
-    socket.send_string("HIDE")
-    socket.recv_string()
-
-    socket.close()
-    context.term()
-
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python3 db_trigger.py <USERNAME> <DURATION_SECONDS>")
-        sys.exit(1)
-
-    username = sys.argv[1]
-    duration = int(sys.argv[2])
-    trigger_ffmpeg_zmq(username, duration)
+# Multi-stream (specify port)
+python3 db_trigger.py "USERNAME" 300 tcp://127.0.0.1:5556
 ```
+
+When the Fingerprint button is pressed in your panel:
+1. Backend gets the USERNAME from DB
+2. Backend calls: python3 db_trigger.py "USERNAME" 300 tcp://127.0.0.1:PORT
+3. Fingerprint appears at random position for 300 seconds
+4. Auto-hides after duration
+5. Next button press triggers again with new random position
 
 ---
 

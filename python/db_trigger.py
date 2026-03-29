@@ -17,6 +17,7 @@ import sys
 import time
 
 # --- CONFIGURATION ---
+# Default ZMQ address - override with 3rd argument for multi-stream setups
 ZMQ_ADDRESS = "tcp://127.0.0.1:5555"
 
 # Predefined 9 Strategic Positions (Resolution Agnostic: 720p, 1080p, 4K)
@@ -65,9 +66,18 @@ def trigger_ffmpeg_zmq(text, duration_sec):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python3 db_trigger.py <USERNAME> <DURATION_SECONDS>")
+        print("Usage: python3 db_trigger.py <USERNAME> <DURATION_SECONDS> [ZMQ_ADDRESS]")
+        print("")
+        print("Examples:")
+        print("  python3 db_trigger.py USER1 300                              # Stream on port 5555")
+        print("  python3 db_trigger.py USER1 300 tcp://127.0.0.1:5556        # Stream on port 5556")
         sys.exit(1)
 
     username = sys.argv[1]
     duration = int(sys.argv[2])
+
+    # Optional: override ZMQ address for multi-stream setups
+    if len(sys.argv) >= 4:
+        ZMQ_ADDRESS = sys.argv[3]
+
     trigger_ffmpeg_zmq(username, duration)
