@@ -1,0 +1,5 @@
+bin/
+build/
+ffmpeg-build/
+ffmpeg-dist/
+*.o
