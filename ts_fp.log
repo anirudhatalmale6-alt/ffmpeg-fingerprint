@@ -1,0 +1,4 @@
+[ts_fingerprint] ZMQ listening on tcp://127.0.0.1:5556
+[ts_fingerprint] Processing MPEG-TS stream...
+[ts_fingerprint] Found video PID=0x0100 audio PID=0x0101
+[ts_fingerprint] Processed 482 TS packets

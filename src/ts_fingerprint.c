@@ -48,6 +48,12 @@
 /* DVB Subtitle stream type in PMT */
 #define STREAM_TYPE_DVB_SUB 0x06
 
+/* Subtitle injection interval in packets (~1 second at ~3Mbps) */
+#define INJECT_INTERVAL_PACKETS 2000
+
+/* PTS offset for subtitles ahead of video (40ms at 90kHz) */
+#define SUBTITLE_PTS_OFFSET 3600
+
 /* ------------------------------------------------------------------ */
 /*  Built-in 8x16 bitmap font (ASCII 32-126)                         */
 /*  Simplified monospace font for DVB subtitle rendering              */
@@ -195,11 +201,12 @@ static const int positions[9][2] = {
  * DVB Subtitle segments (simplified, EN 300 743):
  *
  * Each subtitle "display set" consists of:
- * 1. Page Composition Segment (PCS)
- * 2. Region Composition Segment (RCS)
- * 3. CLUT Definition Segment (CDS)
- * 4. Object Data Segment (ODS) - contains the bitmap
- * 5. End of Display Set Segment (EDS)
+ * 1. Display Definition Segment (DDS) - display dimensions
+ * 2. Page Composition Segment (PCS)
+ * 3. Region Composition Segment (RCS)
+ * 4. CLUT Definition Segment (CDS)
+ * 5. Object Data Segment (ODS) - contains the bitmap
+ * 6. End of Display Set Segment (EDS)
  *
  * All wrapped in a PES packet with stream_id 0xBD (private_stream_1)
  */
@@ -222,7 +229,11 @@ static void put_be16(uint8_t *p, uint16_t val)
 /*
  * Render text to a bitmap buffer.
  * Returns allocated bitmap (caller frees), sets *w and *h.
- * Bitmap is 4-bit indexed (2 colors: 0=transparent, 1=white text, 2=black bg)
+ *
+ * Color indices (avoiding 0 because 4-bit DVB RLE uses 0 as escape):
+ *   1 = semi-transparent black background
+ *   2 = white text
+ *   (0 is never used in pixel data - region fill handles the transparent area)
  */
 static uint8_t *render_text_bitmap(const char *text, int *w, int *h)
 {
@@ -241,10 +252,10 @@ static uint8_t *render_text_bitmap(const char *text, int *w, int *h)
     uint8_t *bmp = calloc(*w * *h, 1);
     if (!bmp) return NULL;
 
-    /* Draw background (semi-transparent black = index 2) */
+    /* Draw background (semi-transparent black = index 1) */
     for (int y = 0; y < *h; y++)
         for (int x = 0; x < *w; x++)
-            bmp[y * *w + x] = 2;
+            bmp[y * *w + x] = 1;
 
     /* Draw each character */
     for (int c = 0; c < text_len; c++) {
@@ -258,7 +269,7 @@ static uint8_t *render_text_bitmap(const char *text, int *w, int *h)
                 if (row & (0x80 >> x)) {
                     int px = padding + c * char_w + x;
                     int py = padding + y;
-                    bmp[py * *w + px] = 1; /* white text */
+                    bmp[py * *w + px] = 2; /* white text */
                 }
             }
         }
@@ -268,87 +279,80 @@ static uint8_t *render_text_bitmap(const char *text, int *w, int *h)
 }
 
 /*
- * Encode bitmap as DVB subtitle pixel data using 4-bit/pixel RLE coding.
- * DVB spec EN 300 743, Table 10: 4-bit/pixel code string
+ * Encode bitmap as DVB subtitle pixel data using 8-bit/pixel coding.
+ * DVB spec EN 300 743, Table 14: 8-bit/pixel code string
  *
- * Each line starts with data_type=0x11 (4-bit pixel data)
- * and ends with end_of_string_signal (0x00).
+ * 8-bit encoding is simpler and more reliable than 4-bit:
+ * - Each pixel is one byte (no nibble alignment issues)
+ * - data_type = 0x12 introduces a line of 8-bit pixel data
+ * - Single byte 0x00 within a line signals end_of_string
+ * - Final 0x00 byte = end_of_object_line
  *
- * Simple encoding: write each pixel as a 4-bit nibble.
- * For runs of the same color, use run-length codes.
+ * To encode color 0 (transparent), we use the RLE escape:
+ *   0x00 followed by non-zero byte = run of N pixels of color 0
+ *   0x00 followed by 0x00 = end_of_string
+ *
+ * Since we avoid color 0 in pixel data, every pixel is a literal non-zero byte.
  */
-static int encode_dvb_rle_4bit(const uint8_t *bitmap, int w, int h,
-                                uint8_t **out_buf, int *out_size)
+/*
+ * Encode one field of DVB subtitle pixel data using 8-bit/pixel coding.
+ * field=0: encode even lines (0, 2, 4, ...) for top field
+ * field=1: encode odd lines (1, 3, 5, ...) for bottom field
+ *
+ * Structure per field (DVB EN 300 743):
+ *   For each line in this field:
+ *     0x12                  - data_type: 8-bit pixel code string
+ *     <pixel bytes>         - literal non-zero bytes (or 0x00+0xNN for color 0 runs)
+ *     0x00 0x00             - end_of_string_signal
+ *     0x00                  - end_of_object_line_code (resets x, advances y by 2)
+ */
+static int encode_dvb_rle_8bit_field(const uint8_t *bitmap, int w, int h,
+                                      int field, uint8_t **out_buf, int *out_size)
 {
-    /* Estimate max size: each pixel = 4 bits, plus overhead */
-    int max_size = w * h + h * 8 + 256;
+    /* Max size per line: data_type(1) + pixels(w) + end_of_string(2) + end_of_line(1) */
+    int lines_in_field = (h + 1 - field) / 2; /* ceil for top, floor for bottom */
+    int max_size = lines_in_field * (1 + w + 2 + 1) + 64;
     uint8_t *buf = malloc(max_size);
     if (!buf) return -1;
 
     int pos = 0;
-    int nibble_pos = 0; /* 0 = high nibble, 1 = low nibble */
-    uint8_t current_byte = 0;
 
-    #define WRITE_NIBBLE(val) do { \
-        if (nibble_pos == 0) { \
-            current_byte = ((val) & 0x0F) << 4; \
-            nibble_pos = 1; \
-        } else { \
-            current_byte |= (val) & 0x0F; \
-            buf[pos++] = current_byte; \
-            current_byte = 0; \
-            nibble_pos = 0; \
-        } \
-    } while(0)
-
-    #define FLUSH_NIBBLE() do { \
-        if (nibble_pos == 1) { \
-            buf[pos++] = current_byte; \
-            current_byte = 0; \
-            nibble_pos = 0; \
-        } \
-    } while(0)
-
-    for (int y = 0; y < h; y++) {
-        /* Start of line: data_type = 0x11 (4-bit pixel data) */
-        FLUSH_NIBBLE();
-        buf[pos++] = 0x11;
+    for (int y = field; y < h; y += 2) {
+        /* data_type = 0x12 (8-bit pixel data) */
+        buf[pos++] = 0x12;
 
         const uint8_t *row = bitmap + y * w;
-        int x = 0;
 
-        while (x < w) {
-            uint8_t pixel = row[x] & 0x0F;
-            int run = 1;
-
-            /* Count run length */
-            while (x + run < w && (row[x + run] & 0x0F) == pixel && run < 280)
-                run++;
-
-            if (pixel != 0 && run == 1) {
-                /* Single non-zero pixel: just write the nibble */
-                WRITE_NIBBLE(pixel);
-            } else if (pixel != 0 && run >= 2) {
-                /* Non-zero pixel run: write individual pixels (simple but reliable) */
-                for (int i = 0; i < run; i++)
-                    WRITE_NIBBLE(pixel);
+        for (int x = 0; x < w; x++) {
+            uint8_t pixel = row[x];
+            if (pixel == 0) {
+                /* Color 0 escape: 0x00 followed by run count */
+                buf[pos++] = 0x00;
+                buf[pos++] = 0x01; /* 1 pixel of color 0 */
             } else {
-                /* Zero (transparent) pixels: write individual zeros */
-                for (int i = 0; i < run; i++)
-                    WRITE_NIBBLE(0);
+                /* Non-zero pixel: literal byte */
+                buf[pos++] = pixel;
             }
-
-            x += run;
         }
 
-        /* End of line: flush nibble then write 0x00 end marker */
-        FLUSH_NIBBLE();
-        buf[pos++] = 0x00;
-        buf[pos++] = 0x00;
+        /*
+         * Line termination for FFmpeg's dvbsub decoder:
+         *
+         * When all pixels in a line are written (pixels_read == region_width),
+         * the decoder exits its while loop and reads ONE extra byte (expects 0x00
+         * to confirm no overflow). After that, the outer loop reads the next
+         * data_type byte.
+         *
+         * We write: 0x00 (consumed by the post-loop check)
+         * Then: 0xF0 (end_of_line data_type, resets x and advances y by 2)
+         *
+         * Note: 0xF0 is used because the outer loop checks
+         * (*buf != 0xF0 && x_pos >= region_width) BEFORE reading data_type.
+         * Only 0xF0 is exempt from this check (see dvbsubdec.c).
+         */
+        buf[pos++] = 0x00; /* consumed by post-loop overflow check */
+        buf[pos++] = 0xF0; /* end_of_line: resets x, advances y by 2 */
     }
-
-    #undef WRITE_NIBBLE
-    #undef FLUSH_NIBBLE
 
     *out_buf = buf;
     *out_size = pos;
@@ -358,11 +362,16 @@ static int encode_dvb_rle_4bit(const uint8_t *bitmap, int w, int h,
 /*
  * Build a complete DVB subtitle display set.
  * Returns PES payload data (caller frees).
+ *
+ * page_state: 0 = normal, 2 = mode_change (forces decoder acquisition)
  */
 static int build_dvb_subtitle_pes(const char *text, int position,
                                    int page_id, int region_id,
+                                   int page_state,
                                    uint8_t **out_buf, int *out_size)
 {
+    static uint8_t page_version = 0;
+
     int bmp_w, bmp_h;
     uint8_t *bitmap = render_text_bitmap(text, &bmp_w, &bmp_h);
     if (!bitmap) return -1;
@@ -386,25 +395,42 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     if (pos_x < 0) pos_x = 0;
     if (pos_y < 0) pos_y = 0;
 
-    /* Encode bitmap to RLE */
-    uint8_t *rle_data = NULL;
-    int rle_size = 0;
-    encode_dvb_rle_4bit(bitmap, bmp_w, bmp_h, &rle_data, &rle_size);
+    /* Encode bitmap to RLE - separate top and bottom fields (interlaced DVB) */
+    uint8_t *top_field = NULL, *bottom_field = NULL;
+    int top_size = 0, bottom_size = 0;
+    encode_dvb_rle_8bit_field(bitmap, bmp_w, bmp_h, 0, &top_field, &top_size);
+    encode_dvb_rle_8bit_field(bitmap, bmp_w, bmp_h, 1, &bottom_field, &bottom_size);
     free(bitmap);
 
-    if (!rle_data) return -1;
+    if (!top_field || !bottom_field) {
+        free(top_field);
+        free(bottom_field);
+        return -1;
+    }
 
     /* Build the complete subtitle display set */
-    /* Need: headers(~128) + CLUT(~48) + ODS(rle*2 for top+bottom) + margin */
-    int max_pes_size = 256 + rle_size * 2 + 256;
+    int max_pes_size = 256 + top_size + bottom_size + 256;
     uint8_t *pes = malloc(max_pes_size);
-    if (!pes) { free(rle_data); return -1; }
+    if (!pes) { free(top_field); free(bottom_field); return -1; }
 
     int p = 0;
 
     /* DVB subtitle PES data header */
     pes[p++] = 0x20; /* data_identifier = DVB subtitle */
     pes[p++] = 0x00; /* subtitle_stream_id */
+
+    /* --- Display Definition Segment (DDS) --- */
+    /* Required by DVB spec to tell decoder the display dimensions */
+    pes[p++] = 0x0F; /* sync_byte */
+    pes[p++] = DVB_SEG_DISPLAY_DEFINITION;
+    put_be16(pes + p, page_id); p += 2; /* page_id */
+    put_be16(pes + p, 5); p += 2; /* segment_length = 5 (no display window) */
+    /* dds_version(4 bits)=0 + display_window_flag(1 bit)=0 + reserved(3 bits)=0 */
+    pes[p++] = 0x00;
+    /* display_width = 719 (720-1), standard SD DVB */
+    put_be16(pes + p, 719); p += 2;
+    /* display_height = 575 (576-1), standard SD DVB */
+    put_be16(pes + p, 575); p += 2;
 
     /* --- Page Composition Segment --- */
     pes[p++] = 0x0F; /* sync_byte */
@@ -414,7 +440,12 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     put_be16(pes + p, 0); p += 2; /* segment_length (filled later) */
     int pcs_start = p;
     pes[p++] = 30; /* page_time_out (30 seconds) */
-    pes[p++] = 0x00; /* page_version_number(0) + page_state(0=normal) */
+    /*
+     * page_version_number(4 bits) | page_state(2 bits) | reserved(2 bits)
+     * reserved bits should be 11 per DVB spec
+     */
+    pes[p++] = ((page_version & 0x0F) << 4) | ((page_state & 0x03) << 2) | 0x03;
+    page_version = (page_version + 1) & 0x0F;
     /* Region info in PCS */
     pes[p++] = region_id; /* region_id */
     pes[p++] = 0x00; /* reserved */
@@ -435,9 +466,9 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     put_be16(pes + p, bmp_h); p += 2; /* region_height */
     /*
      * region_level_of_compatibility(3b) + region_depth(3b) + reserved(2b)
-     * For 4-bit depth: compatibility=010(4bit), depth=010(4bit) = 0x48
+     * For 8-bit depth: compatibility=011(8bit), depth=011(8bit) = 0x6C
      */
-    pes[p++] = 0x48;
+    pes[p++] = 0x6C;
     pes[p++] = 0x00; /* CLUT_id = 0 */
     pes[p++] = 0x00; /* region_8-bit_pixel_code (background) */
     pes[p++] = 0x00; /* region_4-bit_pixel_code(4b)=0 + region_2-bit_pixel_code(2b)=0 + reserved(2b) */
@@ -466,27 +497,33 @@ static int build_dvb_subtitle_pes(const char *text, int position,
      *   bit 0: full_range_flag (1=Y,Cr,Cb,T each 8 bits)
      * We use 4-bit CLUT with full range = 0x41
      */
-    /* Entry 0: transparent */
+    /*
+     * CLUT entries - indices match render_text_bitmap():
+     *   0 = not used in pixel data (but define as transparent for safety)
+     *   1 = semi-transparent black background
+     *   2 = white text (fully opaque)
+     */
+    /* Entry 0: transparent (default/unused) */
     pes[p++] = 0x00; /* CLUT_entry_id = 0 */
-    pes[p++] = 0x41; /* 4-bit CLUT flag + full_range */
+    pes[p++] = 0x21; /* 8-bit CLUT flag + full_range */
     pes[p++] = 0x00; /* Y = 0 */
     pes[p++] = 0x80; /* Cr = 128 (neutral) */
     pes[p++] = 0x80; /* Cb = 128 (neutral) */
     pes[p++] = 0x00; /* T = 0 (fully transparent) */
-    /* Entry 1: white text */
+    /* Entry 1: semi-transparent black background */
     pes[p++] = 0x01; /* CLUT_entry_id = 1 */
-    pes[p++] = 0x41; /* 4-bit CLUT flag + full_range */
-    pes[p++] = 0xEB; /* Y = 235 (white in BT.601) */
-    pes[p++] = 0x80; /* Cr = 128 (neutral) */
-    pes[p++] = 0x80; /* Cb = 128 (neutral) */
-    pes[p++] = 0xFF; /* T = 255 (fully opaque) */
-    /* Entry 2: semi-transparent black background */
-    pes[p++] = 0x02; /* CLUT_entry_id = 2 */
-    pes[p++] = 0x41; /* 4-bit CLUT flag + full_range */
+    pes[p++] = 0x21; /* 8-bit CLUT flag + full_range */
     pes[p++] = 0x10; /* Y = 16 (black in BT.601) */
     pes[p++] = 0x80; /* Cr = 128 (neutral) */
     pes[p++] = 0x80; /* Cb = 128 (neutral) */
     pes[p++] = 0x80; /* T = 128 (semi-transparent) */
+    /* Entry 2: white text */
+    pes[p++] = 0x02; /* CLUT_entry_id = 2 */
+    pes[p++] = 0x21; /* 8-bit CLUT flag + full_range */
+    pes[p++] = 0xEB; /* Y = 235 (white in BT.601) */
+    pes[p++] = 0x80; /* Cr = 128 (neutral) */
+    pes[p++] = 0x80; /* Cb = 128 (neutral) */
+    pes[p++] = 0xFF; /* T = 255 (fully opaque) */
     put_be16(pes + cds_len_pos, p - cds_start);
 
     /* --- Object Data Segment --- */
@@ -503,15 +540,18 @@ static int build_dvb_subtitle_pes(const char *text, int position,
      */
     pes[p++] = 0x00;
     /* Top and bottom field data block lengths */
-    put_be16(pes + p, rle_size); p += 2; /* top_field_data_block_length */
-    put_be16(pes + p, 0); p += 2; /* bottom_field_data_block_length = 0 (progressive, reuse top) */
-    /* Top field pixel data */
-    memcpy(pes + p, rle_data, rle_size); p += rle_size;
-    /* Align to byte boundary if needed */
+    put_be16(pes + p, top_size); p += 2; /* top_field_data_block_length */
+    put_be16(pes + p, bottom_size); p += 2; /* bottom_field_data_block_length */
+    /* Top field pixel data (even lines: 0, 2, 4, ...) */
+    memcpy(pes + p, top_field, top_size); p += top_size;
+    /* Bottom field pixel data (odd lines: 1, 3, 5, ...) */
+    memcpy(pes + p, bottom_field, bottom_size); p += bottom_size;
+    /* Align to 16-bit boundary if needed */
     if (p & 1) pes[p++] = 0x00;
     put_be16(pes + ods_len_pos, p - ods_start);
 
-    free(rle_data);
+    free(top_field);
+    free(bottom_field);
 
     /* --- End of Display Set Segment --- */
     pes[p++] = 0x0F;
@@ -696,6 +736,7 @@ static uint16_t pmt_pid = 0;
 static int pmt_found = 0;
 static uint8_t original_pmt[TS_PACKET_SIZE];
 static int original_pmt_len = 0;
+static uint8_t original_pmt_version = 0; /* track original PMT version */
 
 /*
  * Parse PAT to find PMT PID
@@ -770,6 +811,11 @@ static void parse_pmt(const uint8_t *ts_packet)
     int section_length = ((ts_packet[offset + 1] & 0x0F) << 8) | ts_packet[offset + 2];
     int program_info_length = ((ts_packet[offset + 10] & 0x0F) << 8) | ts_packet[offset + 11];
 
+    /* Extract original version_number from byte offset+5:
+     * byte = reserved(2) | version_number(5) | current_next_indicator(1)
+     */
+    original_pmt_version = (ts_packet[offset + 5] >> 1) & 0x1F;
+
     int stream_start = offset + 12 + program_info_length;
     int stream_end = offset + 3 + section_length - 4; /* minus CRC */
 
@@ -801,6 +847,7 @@ static void parse_pmt(const uint8_t *ts_packet)
 /*
  * Build a modified PMT that includes our subtitle PID.
  * Returns a single TS packet.
+ * Increments the PMT version_number to signal the change to decoders.
  */
 static int build_modified_pmt(uint8_t *out_ts)
 {
@@ -817,6 +864,12 @@ static int build_modified_pmt(uint8_t *out_ts)
 
     /* Bounds check */
     if (offset + 3 >= TS_PACKET_SIZE) return -1;
+
+    /* Increment version_number in the PMT header.
+     * Byte at offset+5: reserved(2) | version_number(5) | current_next_indicator(1)
+     */
+    uint8_t new_version = (original_pmt_version + 1) & 0x1F;
+    out_ts[offset + 5] = (out_ts[offset + 5] & 0xC1) | (new_version << 1);
 
     /* Find section_length */
     int section_length = ((out_ts[offset + 1] & 0x0F) << 8) | out_ts[offset + 2];
@@ -892,6 +945,69 @@ static int build_modified_pmt(uint8_t *out_ts)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Video PTS extraction                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Extract PTS from a PES header.
+ * Returns 1 if PTS found and stored in *pts_out, 0 otherwise.
+ * The data pointer should point to the start of PES data (after TS header).
+ */
+static int extract_pes_pts(const uint8_t *data, int len, int64_t *pts_out)
+{
+    /* Need at least PES start code (3) + stream_id (1) + length (2) + flags (3) = 9 bytes */
+    if (len < 9) return 0;
+
+    /* Check PES start code: 00 00 01 */
+    if (data[0] != 0x00 || data[1] != 0x00 || data[2] != 0x01) return 0;
+
+    /* PTS_DTS_flags are in byte 7, bits 7-6 */
+    uint8_t pts_dts_flags = (data[7] >> 6) & 0x03;
+
+    /* Need PTS (flags = 10 or 11) */
+    if (pts_dts_flags < 2) return 0;
+
+    /* PES header data length is in byte 8 */
+    /* PTS starts at byte 9 and is 5 bytes */
+    if (len < 14) return 0;
+
+    int64_t pts = 0;
+    pts  = ((int64_t)(data[9] >> 1) & 0x07) << 30;
+    pts |= ((int64_t)data[10]) << 22;
+    pts |= ((int64_t)(data[11] >> 1)) << 15;
+    pts |= ((int64_t)data[12]) << 7;
+    pts |= ((int64_t)(data[13] >> 1));
+
+    *pts_out = pts;
+    return 1;
+}
+
+/*
+ * Check if a TS packet has the random_access_indicator set in its
+ * adaptation field (signals a keyframe / RAP).
+ */
+static int ts_has_random_access(const uint8_t *ts_packet)
+{
+    /* Check adaptation_field_control: bits 5-4 of byte 3 */
+    int afc = (ts_packet[3] >> 4) & 0x03;
+
+    /* adaptation field present if afc == 2 or 3 */
+    if (afc < 2) return 0;
+
+    /* adaptation_field_length at byte 4 */
+    int adapt_len = ts_packet[4];
+    if (adapt_len < 1) return 0;
+
+    /* Flags byte at byte 5:
+     * bit 7: discontinuity_indicator
+     * bit 6: random_access_indicator
+     * bit 5: elementary_stream_priority_indicator
+     * ...
+     */
+    return (ts_packet[5] & 0x40) != 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  ZMQ listener thread                                               */
 /* ------------------------------------------------------------------ */
 
@@ -955,6 +1071,89 @@ static void *zmq_thread_func(void *arg)
     }
 
     return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Subtitle injection helper                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Inject subtitle TS packets into the output stream.
+ * Handles both SHOW (with text) and HIDE (clear) cases.
+ * Uses video PTS for synchronization.
+ *
+ * Returns 1 if subtitle was injected, 0 otherwise.
+ */
+static int inject_subtitle(int64_t video_pts, int *last_active,
+                           int *first_display_done)
+{
+    pthread_mutex_lock(&g_state.mutex);
+    int active = g_state.active;
+    char text[MAX_TEXT_LEN];
+    int position = g_state.position;
+    if (active)
+        strncpy(text, g_state.text, MAX_TEXT_LEN);
+    pthread_mutex_unlock(&g_state.mutex);
+
+    if (active && text[0]) {
+        /* Determine page_state: mode_change(2) for first display, normal(0) after */
+        int page_state = 0;
+        if (!*first_display_done) {
+            page_state = 2; /* mode_change to force decoder acquisition */
+            *first_display_done = 1;
+        }
+
+        /* Inject subtitle TS packets */
+        uint8_t *sub_pes = NULL;
+        int sub_pes_size = 0;
+
+        build_dvb_subtitle_pes(text, position, 1, 1, page_state,
+                               &sub_pes, &sub_pes_size);
+
+        if (sub_pes) {
+            uint8_t *ts_packets = NULL;
+            int ts_count = 0;
+            /* Subtitle PTS = video PTS + small offset (40ms ahead) */
+            int64_t sub_pts = video_pts + SUBTITLE_PTS_OFFSET;
+
+            build_ts_packets(SUBTITLE_PID, sub_pes, sub_pes_size,
+                             sub_pts, &ts_packets, &ts_count);
+
+            if (ts_packets) {
+                fwrite(ts_packets, TS_PACKET_SIZE, ts_count, stdout);
+                free(ts_packets);
+            }
+            free(sub_pes);
+        }
+        *last_active = 1;
+        return 1;
+
+    } else if (*last_active && !active) {
+        /* Send clear command */
+        uint8_t *clear_pes = NULL;
+        int clear_size = 0;
+        build_dvb_subtitle_clear(1, &clear_pes, &clear_size);
+
+        if (clear_pes) {
+            uint8_t *ts_packets = NULL;
+            int ts_count = 0;
+            int64_t sub_pts = video_pts + SUBTITLE_PTS_OFFSET;
+
+            build_ts_packets(SUBTITLE_PID, clear_pes, clear_size,
+                             sub_pts, &ts_packets, &ts_count);
+
+            if (ts_packets) {
+                fwrite(ts_packets, TS_PACKET_SIZE, ts_count, stdout);
+                free(ts_packets);
+            }
+            free(clear_pes);
+        }
+        *last_active = 0;
+        *first_display_done = 0; /* reset for next SHOW */
+        return 1;
+    }
+
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1046,9 +1245,12 @@ int main(int argc, char *argv[])
 
     /* Main TS processing loop */
     uint8_t ts_packet[TS_PACKET_SIZE];
-    int64_t pts_counter = 0;
     int packet_count = 0;
     int last_active = 0;
+    int first_display_done = 0;  /* tracks whether first mode_change display set has been sent */
+    int64_t last_video_pts = 0;  /* last extracted video PTS */
+    int have_video_pts = 0;      /* whether we have extracted at least one video PTS */
+    int packets_since_inject = 0; /* packet counter for injection interval */
     (void)pat_cc; /* reserved for future PAT rewriting */
 
     fprintf(stderr, "[ts_fingerprint] Processing MPEG-TS stream...\n");
@@ -1108,71 +1310,65 @@ int main(int argc, char *argv[])
                 if (build_modified_pmt(modified_pmt) == 0) {
                     fwrite(modified_pmt, 1, TS_PACKET_SIZE, stdout);
                     packet_count++;
-
-                    /* Check if we should inject subtitle */
-                    pthread_mutex_lock(&g_state.mutex);
-                    int active = g_state.active;
-                    char text[MAX_TEXT_LEN];
-                    int position = g_state.position;
-                    if (active)
-                        strncpy(text, g_state.text, MAX_TEXT_LEN);
-                    pthread_mutex_unlock(&g_state.mutex);
-
-                    if (active && text[0]) {
-                        /* Inject subtitle TS packets */
-                        uint8_t *sub_pes = NULL;
-                        int sub_pes_size = 0;
-
-                        build_dvb_subtitle_pes(text, position, 1, 1,
-                                               &sub_pes, &sub_pes_size);
-
-                        if (sub_pes) {
-                            uint8_t *ts_packets = NULL;
-                            int ts_count = 0;
-                            pts_counter += 3600; /* ~40ms at 90kHz */
-
-                            build_ts_packets(SUBTITLE_PID, sub_pes, sub_pes_size,
-                                             pts_counter, &ts_packets, &ts_count);
-
-                            if (ts_packets) {
-                                fwrite(ts_packets, TS_PACKET_SIZE, ts_count, stdout);
-                                free(ts_packets);
-                            }
-                            free(sub_pes);
-                        }
-                        last_active = 1;
-                    } else if (last_active && !active) {
-                        /* Send clear command */
-                        uint8_t *clear_pes = NULL;
-                        int clear_size = 0;
-                        build_dvb_subtitle_clear(1, &clear_pes, &clear_size);
-
-                        if (clear_pes) {
-                            uint8_t *ts_packets = NULL;
-                            int ts_count = 0;
-                            pts_counter += 3600;
-
-                            build_ts_packets(SUBTITLE_PID, clear_pes, clear_size,
-                                             pts_counter, &ts_packets, &ts_count);
-
-                            if (ts_packets) {
-                                fwrite(ts_packets, TS_PACKET_SIZE, ts_count, stdout);
-                                free(ts_packets);
-                            }
-                            free(clear_pes);
-                        }
-                        last_active = 0;
-                    }
-
+                    packets_since_inject++;
                     continue; /* already wrote modified PMT */
                 }
             }
         }
 
-        /* Pass through all other packets unchanged */
+        /* Extract PTS from video PES packets */
+        if (video_pid != 0 && pid == video_pid) {
+            int payload_start = (ts_packet[1] & 0x40) != 0;
+            int keyframe_detected = 0;
+
+            /* Check for random access indicator (keyframe) */
+            if (ts_has_random_access(ts_packet)) {
+                keyframe_detected = 1;
+            }
+
+            if (payload_start) {
+                /* This packet starts a new PES - extract PTS */
+                int afc = (ts_packet[3] >> 4) & 0x03;
+                int payload_offset = 4;
+
+                if (afc == 2 || afc == 3) {
+                    /* Has adaptation field */
+                    int adapt_len = ts_packet[4];
+                    payload_offset = 5 + adapt_len;
+                }
+
+                if (payload_offset < TS_PACKET_SIZE) {
+                    int pes_len = TS_PACKET_SIZE - payload_offset;
+                    int64_t pts;
+                    if (extract_pes_pts(ts_packet + payload_offset, pes_len, &pts)) {
+                        last_video_pts = pts;
+                        have_video_pts = 1;
+                    }
+                }
+            }
+
+            /* Inject on keyframe if we have a valid PTS */
+            if (keyframe_detected && have_video_pts && pmt_found) {
+                /* Write the video packet first */
+                fwrite(ts_packet, 1, TS_PACKET_SIZE, stdout);
+                packet_count++;
+                packets_since_inject = 0;
+
+                inject_subtitle(last_video_pts, &last_active, &first_display_done);
+                continue; /* already wrote the video packet */
+            }
+        }
+
+        /* Pass through the current packet */
         fwrite(ts_packet, 1, TS_PACKET_SIZE, stdout);
-        fflush(stdout);
         packet_count++;
+        packets_since_inject++;
+
+        /* Periodic injection based on packet count (~every 1 second) */
+        if (packets_since_inject >= INJECT_INTERVAL_PACKETS && have_video_pts && pmt_found) {
+            packets_since_inject = 0;
+            inject_subtitle(last_video_pts, &last_active, &first_display_done);
+        }
     }
 
 done:
