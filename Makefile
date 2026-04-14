@@ -26,7 +26,7 @@ BUILDDIR = build
 BINDIR = bin
 
 # Standalone tools
-TOOLS = $(BINDIR)/ts_fingerprint $(BINDIR)/sei_reader
+TOOLS = $(BINDIR)/ts_fingerprint $(BINDIR)/sei_reader $(BINDIR)/ffmpeg_fingerprint
 
 .PHONY: all tools clean install help
 
@@ -42,6 +42,10 @@ $(BINDIR)/sei_reader: $(SRCDIR)/sei_reader.c | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 	@echo "Built: $@"
 
+$(BINDIR)/ffmpeg_fingerprint: $(SRCDIR)/ffmpeg_fingerprint.c | $(BINDIR)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "Built: $@"
+
 $(BINDIR):
 	mkdir -p $(BINDIR)
 
@@ -51,13 +55,14 @@ clean:
 install: tools
 	install -m 755 $(BINDIR)/ts_fingerprint /usr/local/bin/
 	install -m 755 $(BINDIR)/sei_reader /usr/local/bin/
+	install -m 755 $(BINDIR)/ffmpeg_fingerprint /usr/local/bin/
 	@echo "Installed to /usr/local/bin/"
 
 help:
 	@echo "FFmpeg Fingerprint Plugin"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make tools     - Build standalone tools"
+	@echo "  make tools     - Build standalone tools (ts_fingerprint, sei_reader, ffmpeg_fingerprint)"
 	@echo "  make clean     - Clean build artifacts"
 	@echo "  make install   - Install to /usr/local/bin"
 	@echo ""
