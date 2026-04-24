@@ -235,26 +235,38 @@ static void put_be16(uint8_t *p, uint16_t val)
  *   2 = white text
  *   (0 is never used in pixel data - region fill handles the transparent area)
  */
-static uint8_t *render_text_bitmap(const char *text, int *w, int *h)
+static uint8_t *render_text_bitmap(const char *text, int region_w, int text_x,
+                                   int *w, int *h)
 {
     int text_len = strlen(text);
     if (text_len == 0) return NULL;
 
-    /* Character dimensions */
     int char_w = 8;
     int char_h = 16;
-    int padding = 4; /* pixels around text */
+    int padding = 4;
 
-    *w = text_len * char_w + padding * 2;
+    int text_w = text_len * char_w + padding * 2;
     *h = char_h + padding * 2;
 
-    /* Allocate bitmap (1 byte per pixel for simplicity) */
+    /*
+     * For MAG/Infomir STB compatibility: render into a full-width bitmap.
+     * MAG boxes ignore PCS region_horizontal_address and center the region.
+     * By making the region full display width (720px), "centering" has no
+     * effect and horizontal positioning is baked into the bitmap itself.
+     */
+    *w = (region_w > 0) ? region_w : text_w;
+    int x_off = (region_w > 0) ? text_x : 0;
+
+    if (x_off + text_w > *w) x_off = *w - text_w;
+    if (x_off < 0) x_off = 0;
+
+    /* color 0 = transparent (calloc zeros), used for padding areas */
     uint8_t *bmp = calloc(*w * *h, 1);
     if (!bmp) return NULL;
 
-    /* Draw background (semi-transparent black = index 1) */
+    /* Draw background (semi-transparent black = index 1) only around text */
     for (int y = 0; y < *h; y++)
-        for (int x = 0; x < *w; x++)
+        for (int x = x_off; x < x_off + text_w && x < *w; x++)
             bmp[y * *w + x] = 1;
 
     /* Draw each character */
@@ -267,9 +279,10 @@ static uint8_t *render_text_bitmap(const char *text, int *w, int *h)
             uint8_t row = glyph[y];
             for (int x = 0; x < char_w; x++) {
                 if (row & (0x80 >> x)) {
-                    int px = padding + c * char_w + x;
+                    int px = x_off + padding + c * char_w + x;
                     int py = padding + y;
-                    bmp[py * *w + px] = 2; /* white text */
+                    if (px < *w)
+                        bmp[py * *w + px] = 2; /* white text */
                 }
             }
         }
@@ -309,9 +322,9 @@ static uint8_t *render_text_bitmap(const char *text, int *w, int *h)
 static int encode_dvb_rle_8bit_field(const uint8_t *bitmap, int w, int h,
                                       int field, uint8_t **out_buf, int *out_size)
 {
-    /* Max size per line: data_type(1) + pixels(w) + end_of_string(2) + end_of_line(1) */
-    int lines_in_field = (h + 1 - field) / 2; /* ceil for top, floor for bottom */
-    int max_size = lines_in_field * (1 + w + 2 + 1) + 64;
+    /* Max size per line: data_type(1) + pixels(w*2 worst case) + end termination(2) */
+    int lines_in_field = (h + 1 - field) / 2;
+    int max_size = lines_in_field * (1 + w * 2 + 2 + 1) + 64;
     uint8_t *buf = malloc(max_size);
     if (!buf) return -1;
 
@@ -323,15 +336,20 @@ static int encode_dvb_rle_8bit_field(const uint8_t *bitmap, int w, int h,
 
         const uint8_t *row = bitmap + y * w;
 
-        for (int x = 0; x < w; x++) {
+        for (int x = 0; x < w; ) {
             uint8_t pixel = row[x];
             if (pixel == 0) {
-                /* Color 0 escape: 0x00 followed by run count */
+                /* RLE run of transparent pixels (color 0) */
+                int run = 0;
+                while (x + run < w && row[x + run] == 0 && run < 127)
+                    run++;
                 buf[pos++] = 0x00;
-                buf[pos++] = 0x01; /* 1 pixel of color 0 */
+                buf[pos++] = run & 0x7F;
+                x += run;
             } else {
                 /* Non-zero pixel: literal byte */
                 buf[pos++] = pixel;
+                x++;
             }
         }
 
@@ -372,27 +390,25 @@ static int build_dvb_subtitle_pes(const char *text, int position,
 {
     static uint8_t page_version = 0;
 
-    int bmp_w, bmp_h;
-    uint8_t *bitmap = render_text_bitmap(text, &bmp_w, &bmp_h);
-    if (!bitmap) return -1;
-
-    /* Calculate position (for 720p reference) */
+    /* Calculate position first (needed for bitmap rendering) */
     int vid_w = 720, vid_h = 576; /* DVB standard display size */
     int pos_x, pos_y;
     if (position >= 0 && position <= 8) {
         pos_x = (positions[position][0] * vid_w) / 100;
         pos_y = (positions[position][1] * vid_h) / 100;
     } else {
-        /* Random position */
         srand(time(NULL));
         pos_x = (positions[rand() % 9][0] * vid_w) / 100;
         pos_y = (positions[rand() % 9][1] * vid_h) / 100;
     }
 
-    /* Clamp to display bounds */
-    if (pos_x + bmp_w > vid_w) pos_x = vid_w - bmp_w;
+    /* Render text into full-width bitmap (position baked in for MAG compat) */
+    int bmp_w, bmp_h;
+    uint8_t *bitmap = render_text_bitmap(text, vid_w, pos_x, &bmp_w, &bmp_h);
+    if (!bitmap) return -1;
+
+    /* Clamp vertical position to display bounds */
     if (pos_y + bmp_h > vid_h) pos_y = vid_h - bmp_h;
-    if (pos_x < 0) pos_x = 0;
     if (pos_y < 0) pos_y = 0;
 
     /* Encode bitmap to RLE - separate top and bottom fields (interlaced DVB) */
@@ -424,13 +440,18 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     pes[p++] = 0x0F; /* sync_byte */
     pes[p++] = DVB_SEG_DISPLAY_DEFINITION;
     put_be16(pes + p, page_id); p += 2; /* page_id */
-    put_be16(pes + p, 5); p += 2; /* segment_length = 5 (no display window) */
-    /* dds_version(4 bits)=0 + display_window_flag(1 bit)=0 + reserved(3 bits)=0 */
-    pes[p++] = 0x00;
+    put_be16(pes + p, 13); p += 2; /* segment_length = 13 (with display window) */
+    /* dds_version(4 bits)=0 + display_window_flag(1 bit)=1 + reserved(3 bits)=0 */
+    pes[p++] = 0x08;
     /* display_width = 719 (720-1), standard SD DVB */
     put_be16(pes + p, 719); p += 2;
     /* display_height = 575 (576-1), standard SD DVB */
     put_be16(pes + p, 575); p += 2;
+    /* explicit display window = full screen (required by MAG/Infomir STBs) */
+    put_be16(pes + p, 0); p += 2;   /* window_horizontal_position_minimum */
+    put_be16(pes + p, 719); p += 2; /* window_horizontal_position_maximum */
+    put_be16(pes + p, 0); p += 2;   /* window_vertical_position_minimum */
+    put_be16(pes + p, 575); p += 2; /* window_vertical_position_maximum */
 
     /* --- Page Composition Segment --- */
     pes[p++] = 0x0F; /* sync_byte */
@@ -449,7 +470,7 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     /* Region info in PCS */
     pes[p++] = region_id; /* region_id */
     pes[p++] = 0x00; /* reserved */
-    put_be16(pes + p, pos_x); p += 2; /* region_horizontal_address */
+    put_be16(pes + p, 0); p += 2; /* region_horizontal_address = 0 (full-width for MAG compat) */
     put_be16(pes + p, pos_y); p += 2; /* region_vertical_address */
     put_be16(pes + pcs_len_pos, p - pcs_start);
 
@@ -461,8 +482,8 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     put_be16(pes + p, 0); p += 2;
     int rcs_start = p;
     pes[p++] = region_id; /* region_id */
-    pes[p++] = 0x00; /* region_version_number(4b)=0 + region_fill_flag(1b)=0 + reserved(3b) */
-    put_be16(pes + p, bmp_w); p += 2; /* region_width */
+    pes[p++] = 0x08; /* region_version_number(4b)=0 + region_fill_flag(1b)=1 + reserved(3b)=000 */
+    put_be16(pes + p, bmp_w); p += 2; /* region_width = full display width (MAG compat) */
     put_be16(pes + p, bmp_h); p += 2; /* region_height */
     /*
      * region_level_of_compatibility(3b) + region_depth(3b) + reserved(2b)
@@ -475,7 +496,7 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     /* Object reference in region */
     put_be16(pes + p, 0x0000); p += 2; /* object_id = 0 */
     /* object_type(2b)=00(bitmap) + object_provider_flag(2b)=00 + object_horizontal_position(12b) */
-    put_be16(pes + p, 0x0000); p += 2; /* type=bitmap, h_pos=0 */
+    put_be16(pes + p, 0x0000); p += 2; /* type=bitmap, h_pos=0 (position baked into bitmap) */
     put_be16(pes + p, 0x0000); p += 2; /* reserved(4b) + object_vertical_position(12b) = 0 */
     put_be16(pes + rcs_len_pos, p - rcs_start);
 
@@ -608,6 +629,12 @@ static int build_dvb_subtitle_clear(int page_id, uint8_t **out_buf, int *out_siz
 static uint8_t subtitle_cc = 0; /* continuity counter for subtitle PID */
 static uint8_t pat_cc = 0;
 static uint8_t pmt_cc = 0;
+
+/* Subtitle language code for PMT descriptor (configurable via --lang) */
+static char subtitle_lang[4] = "eng";
+
+/* Only add subtitle PID to PMT after first SHOW (avoids black bar on STBs) */
+static int inject_subtitle_to_pmt = 0;
 
 /* CRC32 for MPEG-TS PSI tables */
 static uint32_t crc32_table[256];
@@ -910,9 +937,9 @@ static int build_modified_pmt(uint8_t *out_ts)
     /* DVB Subtitle descriptor (tag=0x59) */
     out_ts[p++] = 0x59;  /* descriptor_tag */
     out_ts[p++] = 8;     /* descriptor_length (8 bytes of payload) */
-    out_ts[p++] = 'e';   /* ISO 639 language code: "eng" */
-    out_ts[p++] = 'n';
-    out_ts[p++] = 'g';
+    out_ts[p++] = subtitle_lang[0]; /* ISO 639 language code (configurable via --lang) */
+    out_ts[p++] = subtitle_lang[1];
+    out_ts[p++] = subtitle_lang[2];
     out_ts[p++] = 0x10;  /* subtitling_type: normal DVB */
     out_ts[p++] = 0x00;  /* composition_page_id high */
     out_ts[p++] = 0x01;  /* composition_page_id low */
@@ -1048,6 +1075,7 @@ static void *zmq_thread_func(void *arg)
             g_state.text[MAX_TEXT_LEN - 1] = '\0';
             g_state.position = pos;
             g_state.active = 1;
+            inject_subtitle_to_pmt = 1;
 
             fprintf(stderr, "[ts_fingerprint] SHOW '%s' pos=%d\n",
                     g_state.text, g_state.position);
@@ -1172,6 +1200,7 @@ static void print_usage(const char *progname)
         "  --zmq ADDR     ZeroMQ bind address (default: tcp://127.0.0.1:5556)\n"
         "  --text TEXT     Initial fingerprint text\n"
         "  --position N   Position 0-8 (-1=random, default=-1)\n"
+        "  --lang CODE    Subtitle language code (default: eng)\n"
         "  --help         Show this help\n"
         "\n"
         "ZMQ Commands:\n"
@@ -1201,6 +1230,10 @@ int main(int argc, char *argv[])
             initial_text = argv[++i];
         } else if (strcmp(argv[i], "--position") == 0 && i + 1 < argc) {
             initial_pos = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc) {
+            const char *lang = argv[++i];
+            strncpy(subtitle_lang, lang, 3);
+            subtitle_lang[3] = '\0';
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -1217,6 +1250,7 @@ int main(int argc, char *argv[])
         strncpy(g_state.text, initial_text, MAX_TEXT_LEN - 1);
         g_state.active = 1;
         g_state.position = initial_pos;
+        inject_subtitle_to_pmt = 1;
     }
 
     /* Initialize ZMQ */
@@ -1304,8 +1338,8 @@ int main(int argc, char *argv[])
                 }
             }
 
-            /* Replace PMT with modified version (includes subtitle PID) */
-            if (pmt_found) {
+            /* Replace PMT with modified version only after first fingerprint activation */
+            if (pmt_found && inject_subtitle_to_pmt) {
                 uint8_t modified_pmt[TS_PACKET_SIZE];
                 if (build_modified_pmt(modified_pmt) == 0) {
                     fwrite(modified_pmt, 1, TS_PACKET_SIZE, stdout);
