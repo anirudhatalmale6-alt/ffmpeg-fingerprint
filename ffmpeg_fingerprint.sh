@@ -5,15 +5,32 @@
 # Combines FFmpeg (for demux/remux) with ts_fingerprint (for DVB subtitle injection)
 # into one convenient command. No video re-encoding required.
 #
+# Features:
+#   - DVB subtitle fingerprint injection (random or fixed position)
+#   - Built-in stream stats (no ffprobe needed) via --stats or ZMQ STATS
+#   - VLC auto-display via --forced and --default-sub
+#   - SD/HD/4K auto-scaling
+#   - Enigma2 / MAG STB / VLC / Kodi compatible
+#
 # Usage:
-#   ffmpeg_fingerprint -i SOURCE [--zmq ADDR] [--text TEXT] [--position N] [-f FMT] OUTPUT
+#   ffmpeg_fingerprint -i SOURCE [options] [-f FMT] OUTPUT
 #
 # Examples:
 #   # Live IPTV restream with ZMQ control:
 #   ffmpeg_fingerprint -i "udp://239.1.1.1:1234" --zmq tcp://127.0.0.1:5555 -f mpegts pipe:1
 #
 #   # Static text overlay to file:
-#   ffmpeg_fingerprint -i input.ts --text "USERNAME" --position 0 -f mpegts output.ts
+#   ffmpeg_fingerprint -i input.ts --text "USERNAME" -f mpegts output.ts
+#
+#   # 4K stream with forced subtitle and stats:
+#   ffmpeg_fingerprint -i "http://source/stream" \
+#     --text "USER" --display 3840x2160 --forced --stats 10 \
+#     -f mpegts output.ts
+#
+#   # VLC auto-display (subtitle auto-selected):
+#   ffmpeg_fingerprint -i "http://source/stream" \
+#     --forced --lang eng --default-sub \
+#     -f mpegts output.ts
 #
 #   # HLS source with reconnect, output to UDP:
 #   ffmpeg_fingerprint -i "https://example.com/live.m3u8" \
@@ -22,14 +39,12 @@
 #     -f mpegts "udp://239.1.1.2:1234?pkt_size=1316"
 #
 # ZMQ Commands (send to the --zmq address):
-#   SHOW <text>          - Show fingerprint text
+#   SHOW <text>          - Show fingerprint text (random position)
 #   SHOW <text> <pos>    - Show at specific position (0-8)
 #   HIDE                 - Hide fingerprint
-#   STATUS               - Get current status
-#
-# Positions: 0=top_left 1=top_center 2=top_right
-#            3=mid_left 4=center     5=mid_right
-#            6=bot_left 7=bot_center 8=bot_right
+#   STATUS               - Get fingerprint state
+#   STATS                - Get real-time stream statistics (text)
+#   STATS_JSON           - Get real-time stream statistics (JSON)
 #
 # Copyright (c) 2026 - Custom FFmpeg Plugin
 
@@ -43,6 +58,12 @@ FFMPEG="${FFMPEG_BIN:-ffmpeg}"
 ZMQ_ADDR=""
 FP_TEXT=""
 FP_POSITION=""
+FP_LANG=""
+FP_DISPLAY=""
+FP_FONTSCALE=""
+FP_FORCED=0
+FP_STATS=""
+FP_DEFAULT_SUB=0
 INPUT=""
 OUTPUT=""
 OUTPUT_FMT=""
@@ -54,11 +75,9 @@ CHILD_PIDS=()
 
 cleanup() {
     local exit_code=$?
-    # Kill all child processes
     for pid in "${CHILD_PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null || true
-            # Give it a moment, then force kill
             sleep 0.2
             kill -9 "$pid" 2>/dev/null || true
         fi
@@ -72,7 +91,7 @@ trap cleanup EXIT INT TERM HUP PIPE
 # ---- Usage ----
 usage() {
     cat >&2 <<'USAGE'
-ffmpeg_fingerprint - FFmpeg + DVB subtitle fingerprint overlay
+ffmpeg_fingerprint - FFmpeg + DVB subtitle fingerprint overlay (zero re-encoding)
 
 Usage:
   ffmpeg_fingerprint -i SOURCE [options] [-f FMT] OUTPUT
@@ -81,34 +100,59 @@ Fingerprint Options:
   --zmq ADDR       ZeroMQ bind address for dynamic control
                    (default: tcp://127.0.0.1:5556)
   --text TEXT      Initial/static fingerprint text
-  --position N     Position 0-8 (-1=random, default=-1)
+  --position N     Position 0-8 (-1=random, default=-1 random)
+  --lang CODE      Subtitle language code (default: eng)
+  --display WxH    Display resolution (default: 1920x1080)
+                   720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K
+  --fontscale N    Font scale 1-4 (default: auto based on display)
+  --forced         Mark as hearing-impaired (auto-selects on some players)
+  --default-sub    Add FFmpeg -disposition:s:0 default to output for VLC auto-display
+  --stats N        Print stream stats to stderr every N seconds
 
 FFmpeg Options (passed through):
   -i SOURCE        Input URL/file (required)
   -f FMT           Output format (default: mpegts)
   -reconnect 1     Enable HTTP reconnect
   -reconnect_streamed 1  Reconnect on streamed input
-  -reconnect_delay_max N  Max reconnect delay
   Any other FFmpeg input/output options
 
 Output:
   pipe:1           Output to stdout
   FILE             Output to file
   udp://...        Output to UDP
+  rtmp://...       Output to RTMP
+
+ZMQ Commands (send to --zmq address):
+  SHOW <text>          Show fingerprint (random position)
+  SHOW <text> <pos>    Show at position (0-8)
+  HIDE                 Hide fingerprint
+  STATUS               Get fingerprint state
+  STATS                Get stream statistics (text format)
+  STATS_JSON           Get stream statistics (JSON format)
 
 Examples:
   # ZMQ-controlled live restream:
   ffmpeg_fingerprint -i "udp://239.1.1.1:1234" \
     --zmq tcp://127.0.0.1:5555 -f mpegts pipe:1
 
-  # Static text to file:
-  ffmpeg_fingerprint -i input.ts --text "VIEWER42" -f mpegts output.ts
+  # Static text with VLC auto-display:
+  ffmpeg_fingerprint -i input.ts --text "VIEWER42" \
+    --forced --default-sub -f mpegts output.ts
 
-  # HLS with reconnect:
+  # 4K stream with monitoring:
+  ffmpeg_fingerprint -i "http://source/4k" \
+    --display 3840x2160 --stats 10 --forced \
+    -f mpegts output.ts
+
+  # HLS with reconnect to UDP output:
   ffmpeg_fingerprint -i "https://cdn.example.com/live.m3u8" \
     -reconnect 1 -reconnect_streamed 1 \
     --zmq tcp://127.0.0.1:5555 \
     -f mpegts "udp://239.1.1.2:1234?pkt_size=1316"
+
+  # Stats-only mode (no fingerprint, just monitoring):
+  ffmpeg_fingerprint -i "http://source/stream" \
+    --stats 5 -f mpegts pipe:1
 
 USAGE
     exit 1
@@ -136,6 +180,34 @@ while [ $# -gt 0 ]; do
             FP_POSITION="$2"
             shift 2
             ;;
+        --lang)
+            [ $# -ge 2 ] || { echo "Error: --lang requires a code" >&2; exit 1; }
+            FP_LANG="$2"
+            shift 2
+            ;;
+        --display)
+            [ $# -ge 2 ] || { echo "Error: --display requires WxH" >&2; exit 1; }
+            FP_DISPLAY="$2"
+            shift 2
+            ;;
+        --fontscale)
+            [ $# -ge 2 ] || { echo "Error: --fontscale requires a number" >&2; exit 1; }
+            FP_FONTSCALE="$2"
+            shift 2
+            ;;
+        --forced)
+            FP_FORCED=1
+            shift
+            ;;
+        --default-sub)
+            FP_DEFAULT_SUB=1
+            shift
+            ;;
+        --stats)
+            [ $# -ge 2 ] || { echo "Error: --stats requires interval in seconds" >&2; exit 1; }
+            FP_STATS="$2"
+            shift 2
+            ;;
         --verbose|-v)
             VERBOSE=1
             shift
@@ -154,7 +226,6 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         -*)
-            # Collect as FFmpeg extra arg (with its value if it looks like a flag+value pair)
             FFMPEG_EXTRA_ARGS+=("$1")
             if [ $# -ge 2 ] && [[ ! "$2" =~ ^- ]]; then
                 FFMPEG_EXTRA_ARGS+=("$2")
@@ -163,7 +234,6 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         *)
-            # Last positional argument is the output
             OUTPUT="$1"
             shift
             ;;
@@ -181,20 +251,17 @@ if [ -z "$OUTPUT" ]; then
     usage
 fi
 
-# Check ts_fingerprint binary exists
 if [ ! -x "$TS_FINGERPRINT" ]; then
     echo "Error: ts_fingerprint not found at $TS_FINGERPRINT" >&2
-    echo "Build it first: cd $SCRIPT_DIR && make tools" >&2
+    echo "Build it first: cd $SCRIPT_DIR && make" >&2
     exit 1
 fi
 
-# Check ffmpeg is available
 if ! command -v "$FFMPEG" &>/dev/null; then
     echo "Error: ffmpeg not found. Set FFMPEG_BIN env var or install ffmpeg." >&2
     exit 1
 fi
 
-# Default output format
 if [ -z "$OUTPUT_FMT" ]; then
     OUTPUT_FMT="mpegts"
 fi
@@ -214,12 +281,30 @@ if [ -n "$FP_POSITION" ]; then
     TS_FP_ARGS+=(--position "$FP_POSITION")
 fi
 
-# ---- Build FFmpeg command ----
-FFMPEG_CMD=("$FFMPEG" -hide_banner)
+if [ -n "$FP_LANG" ]; then
+    TS_FP_ARGS+=(--lang "$FP_LANG")
+fi
 
-# Input options
+if [ -n "$FP_DISPLAY" ]; then
+    TS_FP_ARGS+=(--display "$FP_DISPLAY")
+fi
+
+if [ -n "$FP_FONTSCALE" ]; then
+    TS_FP_ARGS+=(--fontscale "$FP_FONTSCALE")
+fi
+
+if [ "$FP_FORCED" -eq 1 ]; then
+    TS_FP_ARGS+=(--forced)
+fi
+
+if [ -n "$FP_STATS" ]; then
+    TS_FP_ARGS+=(--stats "$FP_STATS")
+fi
+
+# ---- Build FFmpeg input command ----
+FFMPEG_CMD=("$FFMPEG" -hide_banner -loglevel error)
+
 if [ ${#FFMPEG_EXTRA_ARGS[@]} -gt 0 ]; then
-    # Insert reconnect and other input-side options before -i
     FFMPEG_CMD+=("${FFMPEG_EXTRA_ARGS[@]}")
 fi
 
@@ -227,11 +312,20 @@ FFMPEG_CMD+=(-i "$INPUT")
 FFMPEG_CMD+=(-c:v copy -c:a copy)
 FFMPEG_CMD+=(-f mpegts pipe:1)
 
+# ---- Build output FFmpeg command (if needed) ----
+OUTPUT_FFMPEG_ARGS=()
+if [ "$FP_DEFAULT_SUB" -eq 1 ]; then
+    OUTPUT_FFMPEG_ARGS+=(-disposition:s:0 default)
+fi
+
 # ---- Logging ----
 if [ "$VERBOSE" -eq 1 ]; then
-    echo "[ffmpeg_fingerprint] FFmpeg command: ${FFMPEG_CMD[*]}" >&2
-    echo "[ffmpeg_fingerprint] ts_fingerprint args: ${TS_FP_ARGS[*]}" >&2
+    echo "[ffmpeg_fingerprint] FFmpeg input: ${FFMPEG_CMD[*]}" >&2
+    echo "[ffmpeg_fingerprint] ts_fingerprint: ${TS_FP_ARGS[*]}" >&2
     echo "[ffmpeg_fingerprint] Output: $OUTPUT (format: $OUTPUT_FMT)" >&2
+    if [ "$FP_DEFAULT_SUB" -eq 1 ]; then
+        echo "[ffmpeg_fingerprint] VLC auto-display: enabled (-disposition:s:0 default)" >&2
+    fi
 fi
 
 echo "[ffmpeg_fingerprint] Starting pipeline..." >&2
@@ -243,31 +337,55 @@ fi
 if [ -n "$FP_TEXT" ]; then
     echo "[ffmpeg_fingerprint]   Text:   $FP_TEXT" >&2
 fi
+if [ -n "$FP_DISPLAY" ]; then
+    echo "[ffmpeg_fingerprint]   Display: $FP_DISPLAY" >&2
+fi
+if [ "$FP_FORCED" -eq 1 ]; then
+    echo "[ffmpeg_fingerprint]   Forced subtitle: yes" >&2
+fi
+if [ -n "$FP_STATS" ]; then
+    echo "[ffmpeg_fingerprint]   Stats interval: ${FP_STATS}s" >&2
+fi
 
 # ---- Execute pipeline ----
 #
-# Pipeline: FFmpeg -> ts_fingerprint -> output
+# Pipeline: FFmpeg(input) -> ts_fingerprint -> [FFmpeg(output)] -> destination
 #
-# For pipe:1 output, ts_fingerprint writes directly to stdout.
-# For file output, we redirect ts_fingerprint stdout to the file.
-# For network output (udp://, rtmp://), we pipe through another FFmpeg.
+# When --default-sub is used or output is network protocol,
+# a second FFmpeg instance handles the output with disposition flags.
 #
 
 case "$OUTPUT" in
     pipe:1|-)
-        # Direct stdout output
-        "${FFMPEG_CMD[@]}" 2>/dev/null | \
-            "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}"
+        if [ "$FP_DEFAULT_SUB" -eq 1 ]; then
+            # Need output FFmpeg for disposition flag
+            "${FFMPEG_CMD[@]}" 2>/dev/null | \
+                "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" | \
+                "$FFMPEG" -hide_banner -loglevel error -i pipe:0 \
+                    -c copy "${OUTPUT_FFMPEG_ARGS[@]}" -f "$OUTPUT_FMT" pipe:1
+        else
+            "${FFMPEG_CMD[@]}" 2>/dev/null | \
+                "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}"
+        fi
         ;;
     udp://*|rtp://*|rtmp://*|rtsp://*|srt://*)
-        # Network output - pipe through a second FFmpeg for proper muxing
+        # Network output - pipe through second FFmpeg for muxing
         "${FFMPEG_CMD[@]}" 2>/dev/null | \
             "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" | \
-            "$FFMPEG" -hide_banner -re -i pipe:0 -c copy -f "$OUTPUT_FMT" "$OUTPUT" 2>/dev/null
+            "$FFMPEG" -hide_banner -loglevel error -re -i pipe:0 \
+                -c copy "${OUTPUT_FFMPEG_ARGS[@]}" -f "$OUTPUT_FMT" "$OUTPUT" 2>/dev/null
         ;;
     *)
-        # File output - redirect ts_fingerprint stdout to file
-        "${FFMPEG_CMD[@]}" 2>/dev/null | \
-            "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" > "$OUTPUT"
+        if [ "$FP_DEFAULT_SUB" -eq 1 ]; then
+            # Need output FFmpeg for disposition flag
+            "${FFMPEG_CMD[@]}" 2>/dev/null | \
+                "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" | \
+                "$FFMPEG" -hide_banner -loglevel error -i pipe:0 \
+                    -c copy "${OUTPUT_FFMPEG_ARGS[@]}" -f "$OUTPUT_FMT" "$OUTPUT"
+        else
+            # Direct file output
+            "${FFMPEG_CMD[@]}" 2>/dev/null | \
+                "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" > "$OUTPUT"
+        fi
         ;;
 esac
