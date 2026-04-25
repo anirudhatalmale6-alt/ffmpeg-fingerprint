@@ -53,11 +53,13 @@
 /* DVB Subtitle stream type in PMT */
 #define STREAM_TYPE_DVB_SUB 0x06
 
-/* Subtitle injection interval in packets (~1 second at ~3Mbps) */
-#define INJECT_INTERVAL_PACKETS 2000
+/* Subtitle re-injection interval (seconds). DVB subtitles persist on screen
+ * until page_timeout, so we only need to re-inject periodically as a refresh.
+ * Too frequent = stream buffering. Too rare = late channel-join display. */
+#define DEFAULT_INJECT_INTERVAL_SEC 8
 
-/* PTS offset for subtitles ahead of video (40ms at 90kHz) */
-#define SUBTITLE_PTS_OFFSET 3600
+/* PTS offset for subtitles ahead of video (20ms at 90kHz) */
+#define SUBTITLE_PTS_OFFSET 1800
 
 /* ------------------------------------------------------------------ */
 /*  Built-in 8x16 bitmap font (ASCII 32-126)                         */
@@ -1600,6 +1602,7 @@ static int inject_subtitle(int64_t video_pts, int *last_active,
 /* ------------------------------------------------------------------ */
 
 static int stats_stderr_interval = 0;
+static int inject_interval_sec = DEFAULT_INJECT_INTERVAL_SEC;
 
 static void print_usage(const char *progname)
 {
@@ -1619,6 +1622,8 @@ static void print_usage(const char *progname)
         "  --fontscale N    Font scale factor 1-4 (default: auto based on display)\n"
         "  --font FILE      Use custom TTF font (default: embedded dash font)\n"
         "  --forced         Mark subtitle as hearing-impaired (auto-selects on some players)\n"
+        "  --inject-interval N  Subtitle re-injection interval in seconds (default: 8)\n"
+        "                   Lower = faster display on channel join, Higher = less overhead\n"
         "\n"
         "Stream Statistics (built-in ffprobe):\n"
         "  --stats N        Print stream stats to stderr every N seconds (0=off)\n"
@@ -1684,6 +1689,10 @@ int main(int argc, char *argv[])
             if (load_ttf_font(argv[++i]) != 0) {
                 fprintf(stderr, "Warning: Failed to load font, using built-in\n");
             }
+        } else if (strcmp(argv[i], "--inject-interval") == 0 && i + 1 < argc) {
+            inject_interval_sec = atoi(argv[++i]);
+            if (inject_interval_sec < 2) inject_interval_sec = 2;
+            if (inject_interval_sec > 30) inject_interval_sec = 30;
         } else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) {
             stats_stderr_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -1736,11 +1745,14 @@ int main(int argc, char *argv[])
     uint8_t ts_packet[TS_PACKET_SIZE];
     int packet_count = 0;
     int last_active = 0;
-    int first_display_done = 0;  /* tracks whether first mode_change display set has been sent */
-    int64_t last_video_pts = 0;  /* last extracted video PTS */
-    int have_video_pts = 0;      /* whether we have extracted at least one video PTS */
-    int packets_since_inject = 0; /* packet counter for injection interval */
-    (void)pat_cc; /* reserved for future PAT rewriting */
+    int first_display_done = 0;
+    int64_t last_video_pts = 0;
+    int have_video_pts = 0;
+    time_t last_inject_time = 0;
+    int needs_immediate_inject = 0;   /* set when text changes or first SHOW */
+    int prev_active_state = 0;        /* track state changes */
+    char prev_text[MAX_TEXT_LEN] = "";
+    (void)pat_cc;
 
     fprintf(stderr, "[ts_fingerprint] Processing MPEG-TS stream...\n");
 
@@ -1808,7 +1820,6 @@ int main(int argc, char *argv[])
                 if (build_modified_pmt(modified_pmt) == 0) {
                     fwrite(modified_pmt, 1, TS_PACKET_SIZE, stdout);
                     packet_count++;
-                    packets_since_inject++;
                     continue; /* already wrote modified PMT */
                 }
             }
@@ -1846,27 +1857,44 @@ int main(int argc, char *argv[])
                 }
             }
 
-            /* Inject on keyframe if we have a valid PTS */
+            /* Detect state/text changes for immediate injection */
             if (keyframe_detected && have_video_pts && pmt_found) {
-                /* Write the video packet first */
-                fwrite(ts_packet, 1, TS_PACKET_SIZE, stdout);
-                packet_count++;
-                packets_since_inject = 0;
+                pthread_mutex_lock(&g_state.mutex);
+                int cur_active = g_state.active;
+                int text_changed = (strcmp(prev_text, g_state.text) != 0);
+                if (cur_active) strncpy(prev_text, g_state.text, MAX_TEXT_LEN);
+                pthread_mutex_unlock(&g_state.mutex);
 
-                inject_subtitle(last_video_pts, &last_active, &first_display_done);
-                continue; /* already wrote the video packet */
+                if (cur_active != prev_active_state || (cur_active && text_changed)) {
+                    needs_immediate_inject = 1;
+                    prev_active_state = cur_active;
+                }
             }
         }
 
         /* Pass through the current packet */
         fwrite(ts_packet, 1, TS_PACKET_SIZE, stdout);
         packet_count++;
-        packets_since_inject++;
 
-        /* Periodic injection based on packet count (~every 1 second) */
-        if (packets_since_inject >= INJECT_INTERVAL_PACKETS && have_video_pts && pmt_found) {
-            packets_since_inject = 0;
-            inject_subtitle(last_video_pts, &last_active, &first_display_done);
+        /* Subtitle injection: time-based with immediate inject on state change */
+        if (have_video_pts && pmt_found) {
+            time_t now = time(NULL);
+            int should_inject = 0;
+
+            if (needs_immediate_inject) {
+                should_inject = 1;
+                needs_immediate_inject = 0;
+            } else if (last_inject_time > 0 && difftime(now, last_inject_time) >= inject_interval_sec) {
+                should_inject = 1;
+            } else if (last_inject_time == 0 && g_state.active) {
+                should_inject = 1;
+            }
+
+            if (should_inject) {
+                inject_subtitle(last_video_pts, &last_active, &first_display_done);
+                last_inject_time = now;
+                fflush(stdout);
+            }
         }
 
         /* Periodic stats output to stderr */
