@@ -179,7 +179,12 @@ static FingerprintState g_state = {
     .position = -1,  /* -1 = random */
 };
 
-/* Position coordinates for 720p reference (scaled proportionally) */
+/* Display reference resolution (configurable via --display WxH) */
+static int display_width = 1920;
+static int display_height = 1080;
+static int font_scale = 2; /* auto: 1 for SD, 2 for 1080p, 3 for 4K */
+
+/* Position coordinates (scaled proportionally to display dimensions) */
 /* Format: {x_percent, y_percent} as percentage of video dimensions */
 static const int positions[9][2] = {
     {5,  5},   /* 0: top_left */
@@ -236,14 +241,15 @@ static void put_be16(uint8_t *p, uint16_t val)
  *   (0 is never used in pixel data - region fill handles the transparent area)
  */
 static uint8_t *render_text_bitmap(const char *text, int region_w, int text_x,
-                                   int *w, int *h)
+                                   int scale, int *w, int *h)
 {
     int text_len = strlen(text);
     if (text_len == 0) return NULL;
 
-    int char_w = 8;
-    int char_h = 16;
-    int padding = 4;
+    if (scale < 1) scale = 1;
+    int char_w = 8 * scale;
+    int char_h = 16 * scale;
+    int padding = 4 * scale;
 
     int text_w = text_len * char_w + padding * 2;
     *h = char_h + padding * 2;
@@ -251,8 +257,8 @@ static uint8_t *render_text_bitmap(const char *text, int region_w, int text_x,
     /*
      * For MAG/Infomir STB compatibility: render into a full-width bitmap.
      * MAG boxes ignore PCS region_horizontal_address and center the region.
-     * By making the region full display width (720px), "centering" has no
-     * effect and horizontal positioning is baked into the bitmap itself.
+     * By making the region full display width, "centering" has no effect
+     * and horizontal positioning is baked into the bitmap itself.
      */
     *w = (region_w > 0) ? region_w : text_w;
     int x_off = (region_w > 0) ? text_x : 0;
@@ -269,20 +275,24 @@ static uint8_t *render_text_bitmap(const char *text, int region_w, int text_x,
         for (int x = x_off; x < x_off + text_w && x < *w; x++)
             bmp[y * *w + x] = 1;
 
-    /* Draw each character */
+    /* Draw each character with font scaling */
     for (int c = 0; c < text_len; c++) {
         unsigned char ch = (unsigned char)text[c];
         if (ch < 32 || ch > 126) ch = '?';
         const uint8_t *glyph = bitmap_font_8x16[ch - 32];
 
-        for (int y = 0; y < char_h; y++) {
-            uint8_t row = glyph[y];
-            for (int x = 0; x < char_w; x++) {
-                if (row & (0x80 >> x)) {
-                    int px = x_off + padding + c * char_w + x;
-                    int py = padding + y;
-                    if (px < *w)
-                        bmp[py * *w + px] = 2; /* white text */
+        for (int gy = 0; gy < 16; gy++) {
+            uint8_t row = glyph[gy];
+            for (int gx = 0; gx < 8; gx++) {
+                if (row & (0x80 >> gx)) {
+                    for (int sy = 0; sy < scale; sy++) {
+                        for (int sx = 0; sx < scale; sx++) {
+                            int px = x_off + padding + c * char_w + gx * scale + sx;
+                            int py = padding + gy * scale + sy;
+                            if (px < *w && py < *h)
+                                bmp[py * *w + px] = 2;
+                        }
+                    }
                 }
             }
         }
@@ -391,7 +401,7 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     static uint8_t page_version = 0;
 
     /* Calculate position first (needed for bitmap rendering) */
-    int vid_w = 720, vid_h = 576; /* DVB standard display size */
+    int vid_w = display_width, vid_h = display_height;
     int pos_x, pos_y;
     if (position >= 0 && position <= 8) {
         pos_x = (positions[position][0] * vid_w) / 100;
@@ -404,7 +414,7 @@ static int build_dvb_subtitle_pes(const char *text, int position,
 
     /* Render text into full-width bitmap (position baked in for MAG compat) */
     int bmp_w, bmp_h;
-    uint8_t *bitmap = render_text_bitmap(text, vid_w, pos_x, &bmp_w, &bmp_h);
+    uint8_t *bitmap = render_text_bitmap(text, vid_w, pos_x, font_scale, &bmp_w, &bmp_h);
     if (!bitmap) return -1;
 
     /* Clamp vertical position to display bounds */
@@ -443,15 +453,13 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     put_be16(pes + p, 13); p += 2; /* segment_length = 13 (with display window) */
     /* dds_version(4 bits)=0 + display_window_flag(1 bit)=1 + reserved(3 bits)=0 */
     pes[p++] = 0x08;
-    /* display_width = 719 (720-1), standard SD DVB */
-    put_be16(pes + p, 719); p += 2;
-    /* display_height = 575 (576-1), standard SD DVB */
-    put_be16(pes + p, 575); p += 2;
+    put_be16(pes + p, vid_w - 1); p += 2; /* display_width */
+    put_be16(pes + p, vid_h - 1); p += 2; /* display_height */
     /* explicit display window = full screen (required by MAG/Infomir STBs) */
-    put_be16(pes + p, 0); p += 2;   /* window_horizontal_position_minimum */
-    put_be16(pes + p, 719); p += 2; /* window_horizontal_position_maximum */
-    put_be16(pes + p, 0); p += 2;   /* window_vertical_position_minimum */
-    put_be16(pes + p, 575); p += 2; /* window_vertical_position_maximum */
+    put_be16(pes + p, 0); p += 2;           /* window_horizontal_position_minimum */
+    put_be16(pes + p, vid_w - 1); p += 2;   /* window_horizontal_position_maximum */
+    put_be16(pes + p, 0); p += 2;           /* window_vertical_position_minimum */
+    put_be16(pes + p, vid_h - 1); p += 2;   /* window_vertical_position_maximum */
 
     /* --- Page Composition Segment --- */
     pes[p++] = 0x0F; /* sync_byte */
@@ -1197,11 +1205,14 @@ static void print_usage(const char *progname)
         "writes MPEG-TS to stdout.\n"
         "\n"
         "Options:\n"
-        "  --zmq ADDR     ZeroMQ bind address (default: tcp://127.0.0.1:5556)\n"
-        "  --text TEXT     Initial fingerprint text\n"
-        "  --position N   Position 0-8 (-1=random, default=-1)\n"
-        "  --lang CODE    Subtitle language code (default: eng)\n"
-        "  --help         Show this help\n"
+        "  --zmq ADDR       ZeroMQ bind address (default: tcp://127.0.0.1:5556)\n"
+        "  --text TEXT       Initial fingerprint text\n"
+        "  --position N     Position 0-8 (-1=random, default=-1)\n"
+        "  --lang CODE      Subtitle language code (default: eng)\n"
+        "  --display WxH    Display resolution (default: 1920x1080)\n"
+        "                   Use 720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K\n"
+        "  --fontscale N    Font scale factor 1-4 (default: auto based on display)\n"
+        "  --help           Show this help\n"
         "\n"
         "ZMQ Commands:\n"
         "  SHOW <text>          Show fingerprint\n"
@@ -1234,6 +1245,18 @@ int main(int argc, char *argv[])
             const char *lang = argv[++i];
             strncpy(subtitle_lang, lang, 3);
             subtitle_lang[3] = '\0';
+        } else if (strcmp(argv[i], "--display") == 0 && i + 1 < argc) {
+            if (sscanf(argv[++i], "%dx%d", &display_width, &display_height) != 2) {
+                fprintf(stderr, "Invalid display format, use WxH (e.g., 1920x1080)\n");
+                return 1;
+            }
+            if (display_height <= 720)       font_scale = 1;
+            else if (display_height <= 1080) font_scale = 2;
+            else                             font_scale = 3;
+        } else if (strcmp(argv[i], "--fontscale") == 0 && i + 1 < argc) {
+            font_scale = atoi(argv[++i]);
+            if (font_scale < 1) font_scale = 1;
+            if (font_scale > 4) font_scale = 4;
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
