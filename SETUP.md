@@ -264,6 +264,95 @@ Your IPTV panel can add this parameter when launching VLC.
 
 ---
 
+## Burn-In Mode (Always Visible on ALL Players)
+
+DVB subtitles depend on the player rendering them. For raw .ts file playback
+or players that ignore subtitle tracks, use burn-in mode. This re-encodes the
+video with the fingerprint text drawn directly into the video frames.
+
+### When to Use Burn-In
+
+- Raw .ts files played directly (no m3u, no panel)
+- VLC without subtitle configuration
+- Web players or browsers
+- Any player that doesn't support DVB subtitles
+- When you need guaranteed 100% visibility
+
+### Usage
+
+```bash
+# Burn-in only (text in video, no subtitle track)
+./ffmpeg_fingerprint.sh -i "SOURCE_URL" \
+  --text "USERNAME_123" --burn-in \
+  -f mpegts output.ts
+
+# Dual mode: burn-in + DVB subtitle (maximum protection)
+./ffmpeg_fingerprint.sh -i "SOURCE_URL" \
+  --text "USERNAME_123" --dual --forced --lang eng \
+  -f mpegts output.ts
+
+# Custom quality settings
+./ffmpeg_fingerprint.sh -i "SOURCE_URL" \
+  --text "USERNAME_123" --burn-in \
+  --burn-preset fast --burn-crf 20 \
+  -f mpegts output.ts
+
+# 4K stream with burn-in
+./ffmpeg_fingerprint.sh -i "SOURCE_URL" \
+  --text "USERNAME_123" --burn-in --display 3840x2160 \
+  -f mpegts output.ts
+```
+
+### Burn-In Options
+
+```
+--burn-in          Enable burn-in mode (re-encodes video with libx264)
+--dual             Burn-in + DVB subtitle combined (maximum protection)
+--burn-preset P    x264 encoding preset (default: ultrafast)
+                   Options: ultrafast, superfast, veryfast, faster, fast, medium
+--burn-crf N       Quality level (default: 23, lower=better quality, 18-28 typical)
+--font FILE        Custom TTF font for burn-in text
+                   Auto-uses bundled fonts/dash.ttf when no --font specified
+```
+
+### Comparison: DVB Subtitle vs Burn-In vs Dual
+
+| Feature | DVB Subtitle | Burn-In | Dual |
+|---------|-------------|---------|------|
+| CPU usage | Zero (copy mode) | High (re-encoding) | High (re-encoding) |
+| MAG/Enigma2 | Auto-display | Always visible | Always visible + subtitle |
+| VLC (configured) | Auto-display | Always visible | Always visible + subtitle |
+| VLC (unconfigured) | Not visible | Always visible | Always visible |
+| Raw .ts playback | Not visible | Always visible | Always visible |
+| Web players | Not visible | Always visible | Always visible |
+| Text position | Random (anti-tamper) | Random (moves slowly) | Both |
+| ZMQ control | Full (SHOW/HIDE) | No (always on) | DVB part controllable |
+
+### CPU Impact
+
+Burn-in re-encodes video, which uses CPU. Rough estimates per stream:
+
+| Preset | Resolution | CPU per stream |
+|--------|-----------|---------------|
+| ultrafast | SD (720x576) | ~0.3 core |
+| ultrafast | HD (1080p) | ~0.8 core |
+| ultrafast | 4K (2160p) | ~3 cores |
+| fast | HD (1080p) | ~2 cores |
+
+For 10,000+ streams, burn-in for ALL channels would require massive CPU.
+Recommended approach:
+1. Use DVB subtitle (zero CPU) for MAG/Enigma2 users (auto-display)
+2. Use burn-in only for channels distributed as raw .ts or to VLC users
+3. Or use dual mode for critical channels that need maximum protection
+
+### Font Auto-Detection
+
+Burn-in mode automatically uses the bundled `fonts/dash.ttf` font.
+Override with `--font /path/to/custom.ttf`.
+The DVB subtitle mode uses the embedded font (compiled into the binary).
+
+---
+
 ## Enigma2 Devices (Zgemma, Dreambox)
 
 DVB subtitles are the NATIVE subtitle format for Enigma2 devices.
@@ -613,6 +702,7 @@ make clean
 3. For VLC: add `-disposition:s:0 default` to output FFmpeg
 4. For MAG: set portal subtitle language to match --lang
 5. Run `./bin/ts_fingerprint --stats 5` to verify stream is flowing
+6. For raw .ts or stubborn players: use `--burn-in` or `--dual` mode
 
 ### Black bar when no fingerprint
 This was fixed - subtitle PID only added to PMT after first SHOW command.
@@ -629,3 +719,8 @@ Check `STATS` via ZMQ or `--stats 5` flag.
 ### Enigma2 not showing subtitles
 Go to Menu > Setup > Subtitles and enable DVB subtitles.
 Set the subtitle language to match your --lang setting.
+
+### Burn-in mode high CPU
+Use `--burn-preset ultrafast` (default) for lowest CPU.
+Increase `--burn-crf` (e.g. 28) for lower quality but faster encoding.
+Consider DVB subtitle mode for most channels, burn-in only where needed.

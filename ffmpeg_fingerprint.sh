@@ -65,6 +65,10 @@ FP_FORCED=0
 FP_FONT=""
 FP_STATS=""
 FP_DEFAULT_SUB=0
+FP_BURN_IN=0
+FP_DUAL=0
+FP_BURN_PRESET="ultrafast"
+FP_BURN_CRF="23"
 INPUT=""
 OUTPUT=""
 OUTPUT_FMT=""
@@ -109,6 +113,12 @@ Fingerprint Options:
   --font FILE      Use custom TTF font instead of built-in bitmap font
   --forced         Mark as hearing-impaired (auto-selects on some players)
   --default-sub    Add FFmpeg -disposition:s:0 default to output for VLC auto-display
+  --burn-in        Burn text into video frames (uses CPU, works on ALL players)
+                   Uses libx264 ultrafast. Guaranteed visible, no subtitle selection needed
+  --dual           Burn-in + DVB subtitle combined (maximum protection)
+                   Text in video frames AND subtitle track for all players/devices
+  --burn-preset P  x264 preset for burn-in mode (default: ultrafast)
+  --burn-crf N     x264 CRF quality for burn-in mode (default: 23, lower=better)
   --stats N        Print stream stats to stderr every N seconds
 
 FFmpeg Options (passed through):
@@ -209,6 +219,25 @@ while [ $# -gt 0 ]; do
         --default-sub)
             FP_DEFAULT_SUB=1
             shift
+            ;;
+        --burn-in)
+            FP_BURN_IN=1
+            shift
+            ;;
+        --dual)
+            FP_BURN_IN=1
+            FP_DUAL=1
+            shift
+            ;;
+        --burn-preset)
+            [ $# -ge 2 ] || { echo "Error: --burn-preset requires a value" >&2; exit 1; }
+            FP_BURN_PRESET="$2"
+            shift 2
+            ;;
+        --burn-crf)
+            [ $# -ge 2 ] || { echo "Error: --burn-crf requires a value" >&2; exit 1; }
+            FP_BURN_CRF="$2"
+            shift 2
             ;;
         --stats)
             [ $# -ge 2 ] || { echo "Error: --stats requires interval in seconds" >&2; exit 1; }
@@ -354,49 +383,140 @@ fi
 if [ "$FP_FORCED" -eq 1 ]; then
     echo "[ffmpeg_fingerprint]   Forced subtitle: yes" >&2
 fi
+if [ "$FP_DUAL" -eq 1 ]; then
+    echo "[ffmpeg_fingerprint]   Mode: DUAL (burn-in + DVB subtitle, maximum protection)" >&2
+    echo "[ffmpeg_fingerprint]   Preset: $FP_BURN_PRESET  CRF: $FP_BURN_CRF" >&2
+elif [ "$FP_BURN_IN" -eq 1 ]; then
+    echo "[ffmpeg_fingerprint]   Mode: BURN-IN (text in video, uses CPU)" >&2
+    echo "[ffmpeg_fingerprint]   Preset: $FP_BURN_PRESET  CRF: $FP_BURN_CRF" >&2
+else
+    echo "[ffmpeg_fingerprint]   Mode: DVB subtitle (zero CPU)" >&2
+fi
 if [ -n "$FP_STATS" ]; then
     echo "[ffmpeg_fingerprint]   Stats interval: ${FP_STATS}s" >&2
 fi
 
 # ---- Execute pipeline ----
-#
-# Pipeline: FFmpeg(input) -> ts_fingerprint -> [FFmpeg(output)] -> destination
-#
-# When --default-sub is used or output is network protocol,
-# a second FFmpeg instance handles the output with disposition flags.
-#
 
-case "$OUTPUT" in
-    pipe:1|-)
-        if [ "$FP_DEFAULT_SUB" -eq 1 ]; then
-            # Need output FFmpeg for disposition flag
+if [ "$FP_BURN_IN" -eq 1 ]; then
+    # ================================================================
+    # BURN-IN MODE: Text burned directly into video frames
+    # Uses FFmpeg drawtext filter - requires video re-encoding
+    # Text is ALWAYS visible regardless of player subtitle settings
+    # ================================================================
+
+    if [ -z "$FP_TEXT" ]; then
+        echo "Error: --burn-in requires --text" >&2
+        exit 1
+    fi
+
+    # Build drawtext filter string
+    FONTSIZE=22
+    if [ -n "$FP_DISPLAY" ]; then
+        HEIGHT=$(echo "$FP_DISPLAY" | cut -dx -f2)
+        if [ "$HEIGHT" -gt 2000 ]; then
+            FONTSIZE=44  # 4K
+        elif [ "$HEIGHT" -gt 720 ]; then
+            FONTSIZE=28  # 1080p
+        fi
+    fi
+
+    # Auto-detect bundled font if no --font specified
+    BURN_FONT="$FP_FONT"
+    if [ -z "$BURN_FONT" ] && [ -f "${SCRIPT_DIR}/fonts/dash.ttf" ]; then
+        BURN_FONT="${SCRIPT_DIR}/fonts/dash.ttf"
+    fi
+
+    # Random position using FFmpeg expression (changes every 30 seconds)
+    DRAWTEXT="drawtext=text='${FP_TEXT}'"
+    DRAWTEXT="${DRAWTEXT}:fontsize=${FONTSIZE}"
+    DRAWTEXT="${DRAWTEXT}:fontcolor=white@0.8"
+    DRAWTEXT="${DRAWTEXT}:box=1:boxcolor=black@0.4:boxborderw=6"
+    DRAWTEXT="${DRAWTEXT}:x=mod(t/30\\,1)*(w-tw)"
+    DRAWTEXT="${DRAWTEXT}:y=mod(t/17\\,1)*(h-th)"
+
+    if [ -n "$BURN_FONT" ]; then
+        DRAWTEXT="${DRAWTEXT}:fontfile=${BURN_FONT}"
+    fi
+
+    # Build the FFmpeg burn-in command (re-encodes video)
+    BURN_CMD=("$FFMPEG" -hide_banner -loglevel error)
+    if [ ${#FFMPEG_EXTRA_ARGS[@]} -gt 0 ]; then
+        BURN_CMD+=("${FFMPEG_EXTRA_ARGS[@]}")
+    fi
+    BURN_CMD+=(-i "$INPUT")
+    BURN_CMD+=(-vf "$DRAWTEXT")
+    BURN_CMD+=(-c:v libx264 -preset "$FP_BURN_PRESET" -tune zerolatency -crf "$FP_BURN_CRF")
+    BURN_CMD+=(-c:a copy)
+
+    # In dual mode, pipe through ts_fingerprint to add DVB subtitle too
+    if [ "$FP_DUAL" -eq 1 ]; then
+        BURN_CMD+=(-f mpegts pipe:1)
+        echo "[ffmpeg_fingerprint]   Dual mode: burn-in + DVB subtitle" >&2
+
+        case "$OUTPUT" in
+            pipe:1|-)
+                "${BURN_CMD[@]}" 2>/dev/null | \
+                    "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}"
+                ;;
+            udp://*|rtp://*|rtmp://*|rtsp://*|srt://*)
+                "${BURN_CMD[@]}" 2>/dev/null | \
+                    "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" | \
+                    "$FFMPEG" -hide_banner -loglevel error -re -i pipe:0 \
+                        -c copy -f "$OUTPUT_FMT" "$OUTPUT" 2>/dev/null
+                ;;
+            *)
+                "${BURN_CMD[@]}" 2>/dev/null | \
+                    "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" > "$OUTPUT"
+                ;;
+        esac
+    else
+        BURN_CMD+=(-f "$OUTPUT_FMT")
+
+        case "$OUTPUT" in
+            pipe:1|-)
+                "${BURN_CMD[@]}" pipe:1
+                ;;
+            *)
+                "${BURN_CMD[@]}" "$OUTPUT"
+                ;;
+        esac
+    fi
+
+else
+    # ================================================================
+    # DVB SUBTITLE MODE (default): Zero CPU, subtitle-based
+    # Pipeline: FFmpeg(input) -> ts_fingerprint -> [FFmpeg(output)]
+    # ================================================================
+
+    case "$OUTPUT" in
+        pipe:1|-)
+            if [ "$FP_DEFAULT_SUB" -eq 1 ]; then
+                "${FFMPEG_CMD[@]}" 2>/dev/null | \
+                    "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" | \
+                    "$FFMPEG" -hide_banner -loglevel error -i pipe:0 \
+                        -c copy "${OUTPUT_FFMPEG_ARGS[@]}" -f "$OUTPUT_FMT" pipe:1
+            else
+                "${FFMPEG_CMD[@]}" 2>/dev/null | \
+                    "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}"
+            fi
+            ;;
+        udp://*|rtp://*|rtmp://*|rtsp://*|srt://*)
             "${FFMPEG_CMD[@]}" 2>/dev/null | \
                 "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" | \
-                "$FFMPEG" -hide_banner -loglevel error -i pipe:0 \
-                    -c copy "${OUTPUT_FFMPEG_ARGS[@]}" -f "$OUTPUT_FMT" pipe:1
-        else
-            "${FFMPEG_CMD[@]}" 2>/dev/null | \
-                "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}"
-        fi
-        ;;
-    udp://*|rtp://*|rtmp://*|rtsp://*|srt://*)
-        # Network output - pipe through second FFmpeg for muxing
-        "${FFMPEG_CMD[@]}" 2>/dev/null | \
-            "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" | \
-            "$FFMPEG" -hide_banner -loglevel error -re -i pipe:0 \
-                -c copy "${OUTPUT_FFMPEG_ARGS[@]}" -f "$OUTPUT_FMT" "$OUTPUT" 2>/dev/null
-        ;;
-    *)
-        if [ "$FP_DEFAULT_SUB" -eq 1 ]; then
-            # Need output FFmpeg for disposition flag
-            "${FFMPEG_CMD[@]}" 2>/dev/null | \
-                "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" | \
-                "$FFMPEG" -hide_banner -loglevel error -i pipe:0 \
-                    -c copy "${OUTPUT_FFMPEG_ARGS[@]}" -f "$OUTPUT_FMT" "$OUTPUT"
-        else
-            # Direct file output
-            "${FFMPEG_CMD[@]}" 2>/dev/null | \
-                "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" > "$OUTPUT"
-        fi
-        ;;
-esac
+                "$FFMPEG" -hide_banner -loglevel error -re -i pipe:0 \
+                    -c copy "${OUTPUT_FFMPEG_ARGS[@]}" -f "$OUTPUT_FMT" "$OUTPUT" 2>/dev/null
+            ;;
+        *)
+            if [ "$FP_DEFAULT_SUB" -eq 1 ]; then
+                "${FFMPEG_CMD[@]}" 2>/dev/null | \
+                    "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" | \
+                    "$FFMPEG" -hide_banner -loglevel error -i pipe:0 \
+                        -c copy "${OUTPUT_FFMPEG_ARGS[@]}" -f "$OUTPUT_FMT" "$OUTPUT"
+            else
+                "${FFMPEG_CMD[@]}" 2>/dev/null | \
+                    "$TS_FINGERPRINT" "${TS_FP_ARGS[@]}" > "$OUTPUT"
+            fi
+            ;;
+    esac
+fi
