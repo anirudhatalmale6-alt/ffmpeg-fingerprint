@@ -867,23 +867,29 @@ static int build_dvb_subtitle_pes(const char *text, int position,
      *   T = 0x00 means fully OPAQUE
      *   T = 0xFF means fully TRANSPARENT
      */
+    /*
+     * CLUT entry flags: 0xE1 = populate ALL tables (2-bit + 4-bit + 8-bit) + full_range
+     * This ensures all decoders find our colors regardless of which table they use.
+     * Data is read once per entry: Y(8b), Cr(8b), Cb(8b), T(8b)
+     * T convention: 0x00 = opaque, 0xFF = transparent (FFmpeg/DVB standard)
+     */
     /* Entry 0: fully transparent (background/unused) */
     pes[p++] = 0x00; /* CLUT_entry_id = 0 */
-    pes[p++] = 0x21; /* 8-bit CLUT flag + full_range */
+    pes[p++] = 0xE1; /* 2-bit + 4-bit + 8-bit CLUT flags + full_range */
     pes[p++] = 0x00; /* Y = 0 */
     pes[p++] = 0x80; /* Cr = 128 (neutral) */
     pes[p++] = 0x80; /* Cb = 128 (neutral) */
     pes[p++] = 0xFF; /* T = 0xFF (fully transparent) */
     /* Entry 1: semi-transparent black background */
     pes[p++] = 0x01; /* CLUT_entry_id = 1 */
-    pes[p++] = 0x21; /* 8-bit CLUT flag + full_range */
+    pes[p++] = 0xE1; /* 2-bit + 4-bit + 8-bit CLUT flags + full_range */
     pes[p++] = 0x10; /* Y = 16 (black in BT.601) */
     pes[p++] = 0x80; /* Cr = 128 (neutral) */
     pes[p++] = 0x80; /* Cb = 128 (neutral) */
     pes[p++] = 0x80; /* T = 0x80 (semi-transparent) */
     /* Entry 2: white text (fully opaque) */
     pes[p++] = 0x02; /* CLUT_entry_id = 2 */
-    pes[p++] = 0x21; /* 8-bit CLUT flag + full_range */
+    pes[p++] = 0xE1; /* 2-bit + 4-bit + 8-bit CLUT flags + full_range */
     pes[p++] = 0xEB; /* Y = 235 (white in BT.601) */
     pes[p++] = 0x80; /* Cr = 128 (neutral) */
     pes[p++] = 0x80; /* Cb = 128 (neutral) */
