@@ -30,7 +30,11 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <math.h>
 #include <zmq.h>
+
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
 
 /* ------------------------------------------------------------------ */
 /*  MPEG-TS Constants                                                 */
@@ -186,6 +190,40 @@ static int font_scale = 2; /* auto: 1 for SD, 2 for 1080p, 3 for 4K */
 
 /* Subtitle type: 0x10=normal, 0x20=hearing_impaired (auto-selects on some players) */
 static uint8_t subtitling_type = 0x10;
+
+/* TTF font support (optional, falls back to built-in bitmap font) */
+static uint8_t *ttf_font_data = NULL;
+static stbtt_fontinfo ttf_font_info;
+static int ttf_font_loaded = 0;
+
+static int load_ttf_font(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[ts_fingerprint] Cannot open font: %s\n", path);
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    ttf_font_data = malloc(size);
+    if (!ttf_font_data) { fclose(f); return -1; }
+    if (fread(ttf_font_data, 1, size, f) != (size_t)size) {
+        free(ttf_font_data); ttf_font_data = NULL;
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    if (!stbtt_InitFont(&ttf_font_info, ttf_font_data,
+                        stbtt_GetFontOffsetForIndex(ttf_font_data, 0))) {
+        fprintf(stderr, "[ts_fingerprint] Invalid TTF font: %s\n", path);
+        free(ttf_font_data); ttf_font_data = NULL;
+        return -1;
+    }
+    ttf_font_loaded = 1;
+    fprintf(stderr, "[ts_fingerprint] Loaded TTF font: %s\n", path);
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Real-time stream statistics (built-in ffprobe replacement)        */
@@ -440,60 +478,138 @@ static uint8_t *render_text_bitmap(const char *text, int region_w, int text_x,
 {
     int text_len = strlen(text);
     if (text_len == 0) return NULL;
-
     if (scale < 1) scale = 1;
-    int char_w = 8 * scale;
-    int char_h = 16 * scale;
-    int padding = 4 * scale;
 
-    int text_w = text_len * char_w + padding * 2;
-    *h = char_h + padding * 2;
+    int padding, text_w, total_h;
 
-    /*
-     * For MAG/Infomir STB compatibility: render into a full-width bitmap.
-     * MAG boxes ignore PCS region_horizontal_address and center the region.
-     * By making the region full display width, "centering" has no effect
-     * and horizontal positioning is baked into the bitmap itself.
-     */
-    *w = (region_w > 0) ? region_w : text_w;
-    int x_off = (region_w > 0) ? text_x : 0;
+    if (ttf_font_loaded) {
+        /* TTF font rendering using stb_truetype */
+        int pixel_height = 16 * scale;
+        float ttf_scale = stbtt_ScaleForPixelHeight(&ttf_font_info, pixel_height);
+        int ascent, descent, line_gap;
+        stbtt_GetFontVMetrics(&ttf_font_info, &ascent, &descent, &line_gap);
+        int baseline = (int)(ascent * ttf_scale);
 
-    if (x_off + text_w > *w) x_off = *w - text_w;
-    if (x_off < 0) x_off = 0;
+        padding = 4 * scale;
+        total_h = pixel_height + padding * 2;
 
-    /* color 0 = transparent (calloc zeros), used for padding areas */
-    uint8_t *bmp = calloc(*w * *h, 1);
-    if (!bmp) return NULL;
+        /* Calculate total text width */
+        text_w = 0;
+        for (int c = 0; c < text_len; c++) {
+            int advance, lsb;
+            stbtt_GetCodepointHMetrics(&ttf_font_info, text[c], &advance, &lsb);
+            text_w += (int)(advance * ttf_scale);
+            if (c < text_len - 1) {
+                int kern = stbtt_GetCodepointKernAdvance(&ttf_font_info, text[c], text[c+1]);
+                text_w += (int)(kern * ttf_scale);
+            }
+        }
+        text_w += padding * 2;
 
-    /* Draw background (semi-transparent black = index 1) only around text */
-    for (int y = 0; y < *h; y++)
-        for (int x = x_off; x < x_off + text_w && x < *w; x++)
-            bmp[y * *w + x] = 1;
+        *h = total_h;
+        *w = (region_w > 0) ? region_w : text_w;
+        int x_off = (region_w > 0) ? text_x : 0;
+        if (x_off + text_w > *w) x_off = *w - text_w;
+        if (x_off < 0) x_off = 0;
 
-    /* Draw each character with font scaling */
-    for (int c = 0; c < text_len; c++) {
-        unsigned char ch = (unsigned char)text[c];
-        if (ch < 32 || ch > 126) ch = '?';
-        const uint8_t *glyph = bitmap_font_8x16[ch - 32];
+        uint8_t *bmp = calloc(*w * *h, 1);
+        if (!bmp) return NULL;
 
-        for (int gy = 0; gy < 16; gy++) {
-            uint8_t row = glyph[gy];
-            for (int gx = 0; gx < 8; gx++) {
-                if (row & (0x80 >> gx)) {
-                    for (int sy = 0; sy < scale; sy++) {
-                        for (int sx = 0; sx < scale; sx++) {
-                            int px = x_off + padding + c * char_w + gx * scale + sx;
-                            int py = padding + gy * scale + sy;
-                            if (px < *w && py < *h)
-                                bmp[py * *w + px] = 2;
+        /* Draw background */
+        for (int y = 0; y < *h; y++)
+            for (int x = x_off; x < x_off + text_w && x < *w; x++)
+                bmp[y * *w + x] = 1;
+
+        /* Render each character using TTF */
+        int cursor_x = x_off + padding;
+        for (int c = 0; c < text_len; c++) {
+            int x0, y0, x1, y1;
+            stbtt_GetCodepointBitmapBox(&ttf_font_info, text[c], ttf_scale, ttf_scale,
+                                        &x0, &y0, &x1, &y1);
+            int glyph_w = x1 - x0;
+            int glyph_h = y1 - y0;
+
+            if (glyph_w > 0 && glyph_h > 0) {
+                uint8_t *glyph_bmp = malloc(glyph_w * glyph_h);
+                if (glyph_bmp) {
+                    stbtt_MakeCodepointBitmap(&ttf_font_info, glyph_bmp,
+                                              glyph_w, glyph_h, glyph_w,
+                                              ttf_scale, ttf_scale, text[c]);
+
+                    for (int gy = 0; gy < glyph_h; gy++) {
+                        for (int gx = 0; gx < glyph_w; gx++) {
+                            int alpha = glyph_bmp[gy * glyph_w + gx];
+                            if (alpha > 80) {
+                                int px = cursor_x + x0 + gx;
+                                int py = padding + baseline + y0 + gy;
+                                if (px >= 0 && px < *w && py >= 0 && py < *h)
+                                    bmp[py * *w + px] = 2;
+                            }
+                        }
+                    }
+                    free(glyph_bmp);
+                }
+            }
+
+            int advance, lsb;
+            stbtt_GetCodepointHMetrics(&ttf_font_info, text[c], &advance, &lsb);
+            cursor_x += (int)(advance * ttf_scale);
+            if (c < text_len - 1) {
+                int kern = stbtt_GetCodepointKernAdvance(&ttf_font_info, text[c], text[c+1]);
+                cursor_x += (int)(kern * ttf_scale);
+            }
+        }
+
+        return bmp;
+
+    } else {
+        /* Built-in 8x16 bitmap font rendering */
+        int char_w = 8 * scale;
+        int char_h = 16 * scale;
+        padding = 4 * scale;
+
+        text_w = text_len * char_w + padding * 2;
+        *h = char_h + padding * 2;
+
+        *w = (region_w > 0) ? region_w : text_w;
+        int x_off = (region_w > 0) ? text_x : 0;
+
+        if (x_off + text_w > *w) x_off = *w - text_w;
+        if (x_off < 0) x_off = 0;
+
+        uint8_t *bmp = calloc(*w * *h, 1);
+        if (!bmp) return NULL;
+
+        /* Draw background */
+        for (int y = 0; y < *h; y++)
+            for (int x = x_off; x < x_off + text_w && x < *w; x++)
+                bmp[y * *w + x] = 1;
+
+        /* Draw each character with font scaling */
+        for (int c = 0; c < text_len; c++) {
+            unsigned char ch = (unsigned char)text[c];
+            if (ch < 32 || ch > 126) ch = '?';
+            const uint8_t *glyph = bitmap_font_8x16[ch - 32];
+
+            for (int gy = 0; gy < 16; gy++) {
+                uint8_t row = glyph[gy];
+                for (int gx = 0; gx < 8; gx++) {
+                    if (row & (0x80 >> gx)) {
+                        for (int sy = 0; sy < scale; sy++) {
+                            for (int sx = 0; sx < scale; sx++) {
+                                int px = x_off + padding + c * char_w + gx * scale + sx;
+                                int py = padding + gy * scale + sy;
+                                if (px < *w && py < *h)
+                                    bmp[py * *w + px] = 2;
+                            }
                         }
                     }
                 }
             }
         }
-    }
 
-    return bmp;
+        return bmp;
+    }
 }
 
 /*
@@ -1486,6 +1602,7 @@ static void print_usage(const char *progname)
         "  --display WxH    Display resolution (default: 1920x1080)\n"
         "                   Use 720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K\n"
         "  --fontscale N    Font scale factor 1-4 (default: auto based on display)\n"
+        "  --font FILE      Use custom TTF font instead of built-in bitmap font\n"
         "  --forced         Mark subtitle as hearing-impaired (auto-selects on some players)\n"
         "\n"
         "Stream Statistics (built-in ffprobe):\n"
@@ -1545,6 +1662,10 @@ int main(int argc, char *argv[])
             if (font_scale > 4) font_scale = 4;
         } else if (strcmp(argv[i], "--forced") == 0) {
             subtitling_type = 0x20;
+        } else if (strcmp(argv[i], "--font") == 0 && i + 1 < argc) {
+            if (load_ttf_font(argv[++i]) != 0) {
+                fprintf(stderr, "Warning: Failed to load font, using built-in\n");
+            }
         } else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) {
             stats_stderr_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -1751,6 +1872,8 @@ done:
     zmq_close(zmq_sock);
     zmq_ctx_destroy(zmq_ctx);
     pthread_mutex_destroy(&g_state.mutex);
+    pthread_mutex_destroy(&g_stats.mutex);
+    if (ttf_font_data) free(ttf_font_data);
 
     return 0;
 }

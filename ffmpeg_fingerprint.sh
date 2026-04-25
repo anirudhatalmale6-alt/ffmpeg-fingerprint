@@ -62,6 +62,7 @@ FP_LANG=""
 FP_DISPLAY=""
 FP_FONTSCALE=""
 FP_FORCED=0
+FP_FONT=""
 FP_STATS=""
 FP_DEFAULT_SUB=0
 INPUT=""
@@ -105,6 +106,7 @@ Fingerprint Options:
   --display WxH    Display resolution (default: 1920x1080)
                    720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K
   --fontscale N    Font scale 1-4 (default: auto based on display)
+  --font FILE      Use custom TTF font instead of built-in bitmap font
   --forced         Mark as hearing-impaired (auto-selects on some players)
   --default-sub    Add FFmpeg -disposition:s:0 default to output for VLC auto-display
   --stats N        Print stream stats to stderr every N seconds
@@ -193,6 +195,11 @@ while [ $# -gt 0 ]; do
         --fontscale)
             [ $# -ge 2 ] || { echo "Error: --fontscale requires a number" >&2; exit 1; }
             FP_FONTSCALE="$2"
+            shift 2
+            ;;
+        --font)
+            [ $# -ge 2 ] || { echo "Error: --font requires a file path" >&2; exit 1; }
+            FP_FONT="$2"
             shift 2
             ;;
         --forced)
@@ -291,6 +298,10 @@ fi
 
 if [ -n "$FP_FONTSCALE" ]; then
     TS_FP_ARGS+=(--fontscale "$FP_FONTSCALE")
+fi
+
+if [ -n "$FP_FONT" ]; then
+    TS_FP_ARGS+=(--font "$FP_FONT")
 fi
 
 if [ "$FP_FORCED" -eq 1 ]; then

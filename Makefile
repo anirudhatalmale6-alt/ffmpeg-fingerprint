@@ -34,8 +34,8 @@ all: tools
 
 tools: $(TOOLS)
 
-$(BINDIR)/ts_fingerprint: $(SRCDIR)/ts_fingerprint.c | $(BINDIR)
-	$(CC) $(CFLAGS) $(ZMQ_CFLAGS) -o $@ $< $(ZMQ_LIBS) $(PTHREAD_LIBS) $(LDFLAGS)
+$(BINDIR)/ts_fingerprint: $(SRCDIR)/ts_fingerprint.c $(SRCDIR)/stb_truetype.h | $(BINDIR)
+	$(CC) $(CFLAGS) $(ZMQ_CFLAGS) -o $@ $< $(ZMQ_LIBS) $(PTHREAD_LIBS) -lm $(LDFLAGS)
 	@echo "Built: $@"
 
 $(BINDIR)/sei_reader: $(SRCDIR)/sei_reader.c | $(BINDIR)
