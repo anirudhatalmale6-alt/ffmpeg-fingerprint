@@ -31,6 +31,36 @@ python3 python/db_trigger.py "USERNAME_123" 300 tcp://127.0.0.1:5556
 
 ---
 
+## Using Without Fingerprint (Stats + Failover Only)
+
+All features work without fingerprint active. If you don't send a SHOW
+command, ts_fingerprint just passes the stream through unchanged while
+still providing stats, monitoring, and failover capabilities.
+
+```bash
+# Stream passthrough with stats only (no fingerprint)
+ffmpeg -i "SOURCE_URL" -c:v copy -c:a copy -f mpegts pipe:1 | \
+  ./bin/ts_fingerprint --zmq tcp://127.0.0.1:5556 --stats 10 | \
+  ffmpeg -i pipe:0 -c copy -f mpegts output.ts
+```
+
+The stream passes through bit-for-bit identical. No subtitle PID is added
+to the PMT until the first SHOW command is received. You get:
+- Real-time stream statistics via STATS/STATS_JSON ZMQ commands
+- --stats N stderr output for logging
+- Source failover (via source_failover.py)
+- Stream health monitoring (via stream_monitor.py)
+
+You can trigger fingerprint later at any time via ZMQ SHOW command when needed.
+Or never trigger it at all - the stream remains untouched.
+
+This means you can use the same pipeline for ALL your channels:
+- Channels that need fingerprint: send SHOW command when needed
+- Channels that don't need fingerprint: just use for stats and failover
+- Same binary, same setup, same monitoring for everything
+
+---
+
 ## Tools Overview
 
 | Tool | Description |
@@ -90,17 +120,71 @@ Override with `--fontscale N`.
 --lang und    # Undefined
 ```
 
-### Random Positioning
+### Positioning Modes
 
-Default behavior: fully random X,Y position across the entire screen.
-Each SHOW cycle picks a new random position. Users cannot predict or block it.
+There are two positioning modes: dynamic random and fixed.
 
-Fixed positions are still available:
+DYNAMIC RANDOM POSITIONING (default - recommended):
+
+Random is the default. No --position flag needed. Every time the fingerprint
+is shown (SHOW command or each cycle), it picks a completely new random X,Y
+position anywhere on the screen. Users cannot predict where it will appear
+and cannot place a static block/overlay to hide it.
+
+```bash
+# Random position (default - no flag needed)
+ts_fingerprint --text "USERNAME_123"
+
+# Via ZMQ: SHOW without position = random
+SHOW test12345
+
+# Each new SHOW picks a different random spot:
+SHOW test12345    # appears at random position (e.g. top-right area)
+HIDE
+SHOW test12345    # appears at different random position (e.g. bottom-left area)
+HIDE
+SHOW test12345    # again different random position
+```
+
+The random position covers the entire screen area (full width x full height)
+minus a margin for the text size. It is true pixel-level random, not just
+9 fixed spots. On a 1920x1080 display, position can be any of 1920x1080 pixels.
+
+With the Python trigger:
+```bash
+# Each trigger = new random position automatically
+python3 python/db_trigger.py "USERNAME_123" 300
+# Wait, trigger again = different position
+python3 python/db_trigger.py "USERNAME_123" 300
+```
+
+With Xtream Codes integration:
+```bash
+# trigger-async: random position each time
+python3 python/xtream_fingerprint.py trigger-async --channel 17832 --username test12345 --duration 300
+```
+
+FIXED POSITIONS (optional - use --position or SHOW with position number):
+
+If you need a specific position, use --position flag or add position number to SHOW:
+
 ```
 --position 0  top-left       --position 1  top-center     --position 2  top-right
 --position 3  mid-left       --position 4  center         --position 5  mid-right
 --position 6  bottom-left    --position 7  bottom-center  --position 8  bottom-right
 ```
+
+```bash
+# Fixed position via CLI
+ts_fingerprint --text "USERNAME_123" --position 4
+
+# Fixed position via ZMQ (number after text)
+SHOW test12345 4    # always center
+SHOW test12345 0    # always top-left
+```
+
+NOTE: Fixed positions are NOT recommended for anti-piracy because users
+can place a static overlay to block that position. Random is always better.
 
 ---
 
