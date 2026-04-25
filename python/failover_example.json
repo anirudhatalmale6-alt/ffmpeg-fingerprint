@@ -1,0 +1,30 @@
+{
+    "sources": [
+        {
+            "name": "main",
+            "url": "http://main-provider.com/live/channel1",
+            "priority": 0
+        },
+        {
+            "name": "backup_eu",
+            "url": "http://backup-eu.com/live/channel1",
+            "priority": 1
+        },
+        {
+            "name": "backup_us",
+            "url": "http://backup-us.com/live/channel1",
+            "priority": 2
+        },
+        {
+            "name": "backup_asia",
+            "url": "http://backup-asia.com/live/channel1",
+            "priority": 3
+        }
+    ],
+    "zmq_addr": "tcp://127.0.0.1:5556",
+    "output": "pipe:1",
+    "check_interval": 5,
+    "fail_threshold": 3,
+    "main_retry_interval": 30,
+    "ts_fp_args": ["--lang", "eng", "--forced", "--display", "1920x1080"]
+}

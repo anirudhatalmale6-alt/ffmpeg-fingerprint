@@ -1,221 +1,547 @@
-# Dynamic FFmpeg Fingerprinting Setup Guide (Zero Re-encoding Version)
+# MPEG-TS Fingerprint Injection - Complete Setup Guide
 
-Drop-in replacement for the original setup. Same workflow, same ZMQ control,
-same Python trigger - but with ZERO re-encoding/transcoding.
+Zero re-encoding DVB subtitle fingerprint injection for IPTV streams.
+Works on VLC, MAG/Infomir STBs, Enigma2 (Zgemma/Dreambox), Kodi, and all IPTV players.
 
 ---
 
-## 1. Prerequisites (Compiling FFmpeg with Fingerprint BSF)
-
-The custom FFmpeg binary includes the `fingerprint_inject` bitstream filter.
-It must be compiled from source with our BSF module.
+## Quick Start
 
 ```bash
-# Install build dependencies
-sudo apt-get update
-sudo apt-get install build-essential yasm nasm pkg-config \
-  libzmq3-dev libx264-dev libx265-dev libfdk-aac-dev \
-  libmp3lame-dev libopus-dev libvpx-dev
-
-# Python dependencies (same as before)
+# 1. Install dependencies
+sudo apt-get install build-essential libzmq3-dev pkg-config
 pip3 install pyzmq
 
-# Build FFmpeg with fingerprint BSF
-chmod +x build_ffmpeg.sh
-./build_ffmpeg.sh
+# 2. Build
+make
 
-# Verify the BSF is available
-./ffmpeg-dist/bin/ffmpeg -bsfs 2>/dev/null | grep fingerprint
-# Should output: fingerprint_inject
+# 3. Run (fingerprint always visible)
+ffmpeg -i "SOURCE_URL" -c:v copy -c:a copy -f mpegts pipe:1 | \
+  ./bin/ts_fingerprint --text "USERNAME_123" | \
+  ffmpeg -i pipe:0 -c copy -f mpegts output.ts
+
+# 4. Run with ZMQ control (show/hide on demand)
+ffmpeg -i "SOURCE_URL" -c:v copy -c:a copy -f mpegts pipe:1 | \
+  ./bin/ts_fingerprint --zmq tcp://127.0.0.1:5556 | \
+  ffmpeg -i pipe:0 -c copy -f mpegts output.ts
+
+# 5. Trigger fingerprint via Python
+python3 python/db_trigger.py "USERNAME_123" 300 tcp://127.0.0.1:5556
 ```
 
 ---
 
-## 2. Running the FFmpeg Listener (The Stream)
+## Tools Overview
 
-**OLD command (re-encodes video, uses CPU):**
-```bash
-ffmpeg -i "SOURCE_URL" \
-  -vf "zmq=bind_address=tcp\://127.0.0.1\:5555,drawtext=fontfile='...':text='':fontsize=22:fontcolor=white:box=1:boxcolor=black@0.3:boxborderw=6:x=10:y=10" \
-  -c:v libx264 -preset ultrafast -tune zerolatency -crf 28 \
-  -c:a copy -f mpegts pipe:1
+| Tool | Description |
+|------|-------------|
+| `bin/ts_fingerprint` | Core tool: injects DVB subtitles into MPEG-TS streams |
+| `bin/ffmpeg_fingerprint` | Single-command wrapper (FFmpeg + ts_fingerprint) |
+| `bin/sei_reader` | Debug tool: reads SEI/subtitle data from streams |
+| `python/db_trigger.py` | Simple trigger: SHOW for N seconds then HIDE |
+| `python/xtream_fingerprint.py` | Xtream Codes panel integration |
+| `python/source_failover.py` | Automatic source failover with priority |
+| `python/stream_monitor.py` | Real-time stream health monitoring |
+
+---
+
+## ts_fingerprint Options
+
+```
+Fingerprint Options:
+  --zmq ADDR       ZeroMQ bind address (default: tcp://127.0.0.1:5556)
+  --text TEXT       Initial fingerprint text (show immediately)
+  --position N     Position 0-8 (-1=random, default=-1)
+  --lang CODE      Subtitle language code (default: eng)
+  --display WxH    Display resolution (default: 1920x1080)
+                   720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K
+  --fontscale N    Font scale factor 1-4 (default: auto based on display)
+  --forced         Mark subtitle as hearing-impaired (auto-selects on some players)
+
+Stream Statistics (built-in ffprobe replacement):
+  --stats N        Print stream stats to stderr every N seconds (0=off)
+                   Stats also available via ZMQ STATS/STATS_JSON commands
 ```
 
-**NEW command (zero re-encoding, zero CPU, fully automatic):**
+### Display Resolution
 
-Auto-cycle mode (show 5min, hide 10min, repeat):
+The `--display` option sets the DVB subtitle coordinate space:
+
 ```bash
-ffmpeg -hide_banner -loglevel error \
-  -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
-  -user_agent "Mozilla/5.0" \
-  -i "SOURCE_URL" \
-  -c:v copy -c:a copy \
-  -bsf:v fingerprint_inject=text='USERNAME':show_duration=300:hide_duration=600 \
-  -map 0:v:0? -map 0:a:0? \
-  -f mpegts -mpegts_copyts 1 pipe:1
+# SD streams (720x576 or 720x480)
+--display 720x576
+
+# HD streams (default - works for most streams)
+--display 1920x1080
+
+# 4K/UHD streams
+--display 3840x2160
 ```
 
-Always-on mode (fingerprint always visible):
+Font size auto-scales: 1x for SD, 2x for HD, 3x for 4K.
+Override with `--fontscale N`.
+
+### Subtitle Language
+
 ```bash
-ffmpeg -i "SOURCE_URL" -c:v copy -c:a copy \
-  -bsf:v fingerprint_inject=text='USERNAME' \
-  -f mpegts pipe:1
+--lang eng    # English (default)
+--lang tur    # Turkish
+--lang fng    # Custom code (won't auto-select on any player)
+--lang und    # Undefined
 ```
 
-Your backend just replaces USERNAME with the actual username from DB. One command per viewer. No Python trigger needed.
+### Random Positioning
 
-Key differences from old command:
-- `-c:v copy` instead of `-c:v libx264` (no video encoding!)
-- `-bsf:v fingerprint_inject=text=USERNAME` instead of `-vf "zmq,drawtext=text='USERNAME'"`
-- No `-preset`, `-tune`, `-crf` needed (nothing to encode)
-- show_duration/hide_duration handles timing automatically (no Python sleep)
-- Random position changes happen automatically at each show cycle
+Default behavior: fully random X,Y position across the entire screen.
+Each SHOW cycle picks a new random position. Users cannot predict or block it.
 
-Works with ALL output formats:
+Fixed positions are still available:
+```
+--position 0  top-left       --position 1  top-center     --position 2  top-right
+--position 3  mid-left       --position 4  center         --position 5  mid-right
+--position 6  bottom-left    --position 7  bottom-center  --position 8  bottom-right
+```
+
+---
+
+## ZMQ Commands
+
+| Command | Response | Description |
+|---------|----------|-------------|
+| `SHOW text` | `OK` | Show fingerprint with random position |
+| `SHOW text 3` | `OK` | Show at specific position (0-8) |
+| `HIDE` | `OK` | Hide fingerprint |
+| `STATUS` | `active=1 text=USER pos=-1` | Get fingerprint state |
+| `STATS` | `uptime=1h23m... video_codec=H.264...` | Stream stats (text) |
+| `STATS_JSON` | `{"uptime_seconds":...}` | Stream stats (JSON) |
+
+### STATS Response Fields
+
+| Field | Description |
+|-------|-------------|
+| `uptime_seconds` | Time since ts_fingerprint started |
+| `video_codec` | Detected video codec (H.264, H.265, MPEG-2) |
+| `audio_codec` | Detected audio codec (AAC, MP3, AC3) |
+| `video_pid` / `audio_pid` | Stream PID numbers |
+| `total_bitrate_kbps` | Total stream bitrate |
+| `video_bitrate_kbps` | Video bitrate |
+| `audio_bitrate_kbps` | Audio bitrate |
+| `fps` | Detected frames per second |
+| `total_packets` | Total TS packets processed |
+| `cc_errors` | Continuity counter errors (packet loss) |
+| `idle_seconds` | Seconds since last data received |
+| `stream_healthy` | true/false based on data flow |
+| `fingerprint_active` | Whether fingerprint is currently shown |
+| `fingerprint_text` | Current fingerprint text |
+
+---
+
+## VLC Auto-Display (No Manual Subtitle Selection)
+
+DVB subtitles require the player to have subtitles enabled.
+For VLC to auto-display the fingerprint without selecting it:
+
+### Option 1: FFmpeg disposition flag (recommended)
+
+Pipe ts_fingerprint output through FFmpeg with `-disposition:s:0 default`:
+
 ```bash
-# MPEG-TS
--f mpegts pipe:1
+ffmpeg -i "SOURCE" -c:v copy -c:a copy -f mpegts pipe:1 | \
+  ./bin/ts_fingerprint --zmq tcp://127.0.0.1:5556 --forced --lang eng | \
+  ffmpeg -i pipe:0 -c copy -disposition:s:0 default -f mpegts pipe:1
+```
+
+The `-disposition:s:0 default` marks the first subtitle track as "default"
+in the output. VLC and most players auto-display default subtitle tracks.
+No re-encoding needed (uses `-c copy`).
+
+### Option 2: Hearing-impaired flag
+
+```bash
+./bin/ts_fingerprint --forced --lang eng
+```
+
+The `--forced` flag sets the DVB subtitling_type to "hearing impaired"
+which some players auto-select.
+
+### Option 3: VLC settings (one-time per user)
+
+VLC > Tools > Preferences > Subtitles/OSD:
+- Set "Subtitle track" to 0
+- Or set "Subtitle language" to match your --lang setting
+
+### Option 4: VLC command-line parameter
+
+```bash
+vlc --sub-track=0 "stream_url"
+```
+
+Your IPTV panel can add this parameter when launching VLC.
+
+---
+
+## Enigma2 Devices (Zgemma, Dreambox)
+
+DVB subtitles are the NATIVE subtitle format for Enigma2 devices.
+These boxes are designed for DVB-S/DVB-T/DVB-C which uses exactly the
+same subtitle standard. ts_fingerprint works natively on Enigma2.
+
+### Setup for Enigma2
+
+```bash
+# Use matching language for auto-display
+./bin/ts_fingerprint --lang eng --forced
+
+# The m3u list entry just points to the stream output as normal
+# Enigma2 auto-detects and displays DVB subtitles
+```
+
+### Enigma2 Subtitle Settings
+
+On the Enigma2 box: Menu > Setup > Subtitles
+- Enable DVB subtitles
+- Set preferred language to match your --lang setting
+- Subtitles will auto-display when fingerprint is triggered
+
+Most Enigma2 images (OpenATV, OpenPLi, VTi) have DVB subtitle
+support enabled by default.
+
+---
+
+## MAG/Infomir STB Compatibility
+
+MAG boxes are fully supported. The fingerprint uses full-width bitmap
+rendering which prevents MAG's subtitle centering from breaking the
+position. Horizontal and vertical positioning works correctly.
+
+MAG Portal Settings: Settings > Subtitle language > set to match --lang
+This auto-enables subtitle display for all users.
+
+---
+
+## Source Failover
+
+Automatic failover between multiple stream sources with priority management.
+
+### Quick Start
+
+```bash
+python3 python/source_failover.py \
+  --sources "main=http://main-src/stream,backup1=http://backup1/stream,backup2=http://backup2/stream" \
+  --zmq tcp://127.0.0.1:5556 \
+  --output pipe:1
+```
+
+### How It Works
+
+1. Starts with the highest-priority (main) source
+2. Monitors stream health via built-in STATS (no extra connections)
+3. Detects: process death, data stall, low FPS, low bitrate, audio/video loss
+4. After 3 consecutive health check failures, switches to next priority source
+5. Periodically checks if main source is back online (every 30s)
+6. Auto-reconnects to main source when it recovers
+
+### Config File
+
+```bash
+python3 python/source_failover.py --config python/failover_example.json
+```
+
+Example `failover_example.json`:
+```json
+{
+    "sources": [
+        {"name": "main", "url": "http://main/stream", "priority": 0},
+        {"name": "backup_eu", "url": "http://eu/stream", "priority": 1},
+        {"name": "backup_us", "url": "http://us/stream", "priority": 2}
+    ],
+    "zmq_addr": "tcp://127.0.0.1:5556",
+    "check_interval": 5,
+    "fail_threshold": 3,
+    "main_retry_interval": 30,
+    "ts_fp_args": ["--lang", "eng", "--forced"]
+}
+```
+
+### Priority System
+
+Priority 0 = main (highest priority, always preferred)
+Priority 1 = first backup
+Priority 2 = second backup
+...
+
+When main source fails:
+1. Try backup sources in priority order
+2. Skip recently-failed sources (10s cooldown)
+3. Background thread checks main source every 30s
+4. When main is back, auto-switch back to main
+
+### Failover Options
+
+```
+--check-interval N    Health check every N seconds (default: 5)
+--fail-threshold N    Consecutive failures before failover (default: 3)
+--main-retry N        Seconds between main source recovery checks (default: 30)
+--lang CODE           Subtitle language for fingerprint
+--display WxH         Display resolution
+--forced              Force subtitle display
+```
+
+---
+
+## Xtream Codes Panel Integration
+
+### Channel Management
+
+```bash
+# Start a channel with fingerprint support
+python3 python/xtream_fingerprint.py start \
+  --channel 17832 --source "http://source/live/stream" \
+  --lang eng --forced
+
+# Stop a channel
+python3 python/xtream_fingerprint.py stop --channel 17832
+
+# List all running channels
+python3 python/xtream_fingerprint.py list
+```
+
+### Triggering Fingerprints
+
+```bash
+# Blocking trigger (waits for duration, then hides)
+python3 python/xtream_fingerprint.py trigger \
+  --channel 17832 --username "test12345" --duration 300
+
+# Non-blocking trigger (returns immediately, auto-hides in background)
+python3 python/xtream_fingerprint.py trigger-async \
+  --channel 17832 --username "test12345" --duration 300
+
+# Trigger on multiple channels at once
+python3 python/xtream_fingerprint.py bulk-trigger \
+  --channels "17832,17833,17834" --username "test12345" --duration 300
+```
+
+### Stream Monitoring
+
+```bash
+# Get stats for a channel
+python3 python/xtream_fingerprint.py stats --channel 17832
+
+# JSON format (for API integration)
+python3 python/xtream_fingerprint.py stats --channel 17832 --json
+```
+
+### ZMQ Port Assignment
+
+Each channel gets a unique ZMQ port: `5600 + (channel_id % 20000)`
+
+Examples:
+- Channel 17832 -> port 5600 + 17832 = port 23432
+- Channel 100 -> port 5700
+
+### Backend Integration Example (Python)
+
+```python
+import subprocess
+
+def trigger_fingerprint(channel_id, username, duration=300):
+    """Trigger fingerprint from your panel backend."""
+    subprocess.Popen([
+        "python3", "python/xtream_fingerprint.py",
+        "trigger-async",
+        "--channel", str(channel_id),
+        "--username", username,
+        "--duration", str(duration),
+    ])
+
+def get_stream_stats(channel_id):
+    """Get stream stats for panel dashboard."""
+    import zmq, json
+    port = 5600 + (channel_id % 20000)
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, 3000)
+    sock.connect(f"tcp://127.0.0.1:{port}")
+    sock.send_string("STATS_JSON")
+    stats = json.loads(sock.recv_string())
+    sock.close()
+    ctx.term()
+    return stats
+
+# Usage from your panel's fingerprint button handler:
+trigger_fingerprint(17832, "user_john_123", 300)
+
+# Usage for stream dashboard:
+stats = get_stream_stats(17832)
+print(f"Bitrate: {stats['video_bitrate_kbps']}kbps, FPS: {stats['fps']}")
+```
+
+### Backend Integration Example (PHP)
+
+```php
+<?php
+// Trigger fingerprint from PHP backend
+function trigger_fingerprint($channel_id, $username, $duration = 300) {
+    $cmd = sprintf(
+        'python3 python/xtream_fingerprint.py trigger-async --channel %d --username %s --duration %d',
+        intval($channel_id),
+        escapeshellarg($username),
+        intval($duration)
+    );
+    exec($cmd . ' > /dev/null 2>&1 &');
+}
+
+// Get stream stats
+function get_stream_stats($channel_id) {
+    $port = 5600 + ($channel_id % 20000);
+    $cmd = sprintf(
+        'python3 python/xtream_fingerprint.py stats --channel %d --json',
+        intval($channel_id)
+    );
+    $output = shell_exec($cmd);
+    return json_decode($output, true);
+}
+
+// When fingerprint button is pressed:
+trigger_fingerprint(17832, $_GET['username'], 300);
+?>
+```
+
+---
+
+## Stream Health Monitoring
+
+### Dashboard Mode
+
+```bash
+# Auto-discover and monitor all running channels
+python3 python/stream_monitor.py --auto
+
+# Continuous refresh every 5 seconds
+python3 python/stream_monitor.py --auto --loop 5
+
+# JSON output for API/web dashboard
+python3 python/stream_monitor.py --auto --json
+```
+
+### Health Status Levels
+
+| Status | Meaning |
+|--------|---------|
+| HEALTHY | Stream flowing, good FPS and bitrate |
+| DEGRADED | Stream flowing but low FPS, bitrate, or CC errors |
+| DOWN | No data flowing (idle > 10 seconds) |
+| OFFLINE | ts_fingerprint not responding on ZMQ |
+
+### Integration with Failover
+
+The source_failover.py script uses the same STATS mechanism internally.
+When it detects degraded/down status, it automatically switches to backup sources.
+
+---
+
+## Output Formats
+
+ts_fingerprint outputs MPEG-TS to stdout. Pipe it to FFmpeg for any output format:
+
+```bash
+# MPEG-TS file
+... | ./bin/ts_fingerprint ... > output.ts
 
 # HLS
--f hls -hls_time 4 -hls_list_size 5 /path/to/stream.m3u8
-
-# DASH
--f dash -seg_duration 4 /path/to/manifest.mpd
+... | ./bin/ts_fingerprint ... | \
+  ffmpeg -i pipe:0 -c copy -f hls -hls_time 4 /path/stream.m3u8
 
 # RTMP
--f flv rtmp://server/live/key
+... | ./bin/ts_fingerprint ... | \
+  ffmpeg -i pipe:0 -c copy -f flv rtmp://server/live/key
 
-# RTSP (via RTSP server)
--f rtsp rtsp://server:8554/stream
+# HTTP push
+... | ./bin/ts_fingerprint ... | \
+  ffmpeg -i pipe:0 -c copy -f mpegts http://server:8080/stream
 
-# HTTP (via pipe or direct)
--f mpegts http://server:8080/stream
+# With VLC auto-display (add disposition flag)
+... | ./bin/ts_fingerprint --forced ... | \
+  ffmpeg -i pipe:0 -c copy -disposition:s:0 default -f mpegts output.ts
 ```
 
 ---
 
-## 3. Multiple Streams (Different ZMQ Ports)
-
-Each stream needs its own ZMQ port. Your backend assigns a unique port per stream:
+## Building
 
 ```bash
-# Stream 1 (port 5555)
-ffmpeg -i "SOURCE_1" -c:v copy -c:a copy \
-  -bsf:v fingerprint_inject=zmq_addr=tcp\\://127.0.0.1\\:5555 \
-  -f mpegts pipe:1
+# Install dependencies
+sudo apt-get install build-essential libzmq3-dev pkg-config
+pip3 install pyzmq
 
-# Stream 2 (port 5556)
-ffmpeg -i "SOURCE_2" -c:v copy -c:a copy \
-  -bsf:v fingerprint_inject=zmq_addr=tcp\\://127.0.0.1\\:5556 \
-  -f mpegts pipe:1
+# Build all tools
+make
 
-# Stream 3 (port 5557)
-ffmpeg -i "SOURCE_3" -c:v copy -c:a copy \
-  -bsf:v fingerprint_inject=zmq_addr=tcp\\://127.0.0.1\\:5557 \
-  -f mpegts pipe:1
-```
+# Install to /usr/local/bin (optional)
+sudo make install
 
-Trigger fingerprint on specific stream:
-```bash
-# Fingerprint on Stream 1
-python3 db_trigger.py "USERNAME" 300 tcp://127.0.0.1:5555
-
-# Fingerprint on Stream 2
-python3 db_trigger.py "USERNAME" 300 tcp://127.0.0.1:5556
+# Clean build
+make clean
 ```
 
 ---
 
-## 4. The Backend Python Trigger (Drop-in Replacement)
+## Full Pipeline Example (Xtream Codes)
 
-Same usage as the original `db_trigger.py`:
-
-```bash
-# Single stream (default port 5555)
-python3 db_trigger.py "USERNAME" 300
-
-# Multi-stream (specify port)
-python3 db_trigger.py "USERNAME" 300 tcp://127.0.0.1:5556
 ```
-
-When the Fingerprint button is pressed in your panel:
-1. Backend gets the USERNAME from DB
-2. Backend calls: python3 db_trigger.py "USERNAME" 300 tcp://127.0.0.1:PORT
-3. Fingerprint appears at random position for 300 seconds
-4. Auto-hides after duration
-5. Next button press triggers again with new random position
-
----
-
-## 4. How to Test Your Integration
-
-1. Start the stream with ONE command (username from DB, fully automatic):
-   ```bash
-   ffmpeg -i "SOURCE_URL" -c:v copy -c:a copy \
-     -bsf:v fingerprint_inject=text='TEST_USER_123':show_duration=300:hide_duration=600 \
-     -f mpegts pipe:1 > output.ts
-   ```
-   That's it. No Python trigger needed. The fingerprint:
-   - Shows "TEST_USER_123" immediately
-   - Shows for 300 seconds (5 minutes)
-   - Hides for 600 seconds (10 minutes)
-   - Shows again with a new random position
-   - Repeats forever
-
-2. The stream does NOT re-encode! Zero CPU usage for video processing.
-
-3. To verify the fingerprint was injected, use the sei_reader tool:
-   ```bash
-   ffmpeg -i output.ts -c:v copy -f h264 pipe:1 | ./bin/sei_reader
-   # Output: [FINGERPRINT #1] TEST_USER_123
-   ```
-
-4. Your backend integration:
-   ```python
-   # In your backend, just build the FFmpeg command with the username:
-   username = fetch_username_from_db(user_id)
-   cmd = f'ffmpeg -i "{source_url}" -c:v copy -c:a copy ' \
-         f'-bsf:v fingerprint_inject=text={username}:show_duration=300:hide_duration=600 ' \
-         f'-f mpegts pipe:1'
-   subprocess.Popen(cmd, shell=True)
-   ```
-
----
-
-## 5. ZMQ Command Protocol
-
-Same REQ/REP pattern as the original. Commands:
-
-| Command | Description |
-|---------|-------------|
-| SHOW text | Activate fingerprint with text |
-| HIDE | Deactivate fingerprint |
-| TEXT text | Update text without changing state |
-| STATUS | Get current state |
-
----
-
-## 6. Static Mode (No ZMQ)
-
-For fixed fingerprint text without dynamic control:
-```bash
-ffmpeg -i "SOURCE_URL" -c:v copy -c:a copy \
-  -bsf:v fingerprint_inject=text=FIXED_USER_ID \
-  -f mpegts pipe:1
+┌─────────────────────────────────────────────────────────────────────┐
+│ Source Provider                                                       │
+│ http://provider.com/live/channel1                                    │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                    ┌──────▼���─────┐
+                    │   FFmpeg    │  -c:v copy -c:a copy (zero CPU)
+                    │ (no encode) │
+                    └──────┬──────┘
+                           │ pipe (MPEG-TS)
+                    ┌──────▼──────────────┐
+                    │  ts_fingerprint     │  DVB subtitle injection
+                    │  --zmq :5556        │  + real-time stream stats
+                    │  --forced --lang eng│
+                    └──────┬──────────────┘
+                           │ pipe (MPEG-TS + subtitles)
+                    ┌──────▼──────┐
+                    │   Output    │  HLS / RTMP / MPEG-TS / ...
+                    │  (FFmpeg)   │  -disposition:s:0 default
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+         ┌────▼────┐ ┌─���──▼────┐ ┌────▼────┐
+         │  VLC    │ │  MAG    │ │ Enigma2 │
+         │ (auto)  │ │ (auto)  │ │ (native)│
+         └───���─────┘ └─────────┘ └─────────┘
 ```
 
 ---
 
-## Comparison
+## Troubleshooting
 
-| Feature | OLD (drawtext) | NEW (fingerprint_inject) |
-|---------|---------------|-------------------------|
-| Re-encoding | Yes (libx264) | No (-c:v copy) |
-| CPU usage | High | Zero (video) |
-| Visible text | Yes (burned in) | Forensic (SEI data) |
-| ZMQ control | Yes | Yes (same) |
-| Python trigger | Same | Same (drop-in) |
-| H.264 support | Yes | Yes |
-| H.265 support | Yes | Yes |
-| All outputs | Yes | Yes |
-| Tamper-proof | Can be cropped | Cannot be removed |
+### Fingerprint not visible
+1. Check subtitles are enabled in player
+2. Try `--forced --lang eng` flags
+3. For VLC: add `-disposition:s:0 default` to output FFmpeg
+4. For MAG: set portal subtitle language to match --lang
+5. Run `./bin/ts_fingerprint --stats 5` to verify stream is flowing
+
+### Black bar when no fingerprint
+This was fixed - subtitle PID only added to PMT after first SHOW command.
+If you see it, make sure you're using the latest build.
+
+### MAG STB shows text in center only
+Fixed with full-width bitmap rendering. Position is baked into the bitmap.
+Verify you have the latest code (`git pull && make`).
+
+### Stream stats show 0 FPS / 0 bitrate
+Wait a few seconds after starting. Stats need initial data to calculate.
+Check `STATS` via ZMQ or `--stats 5` flag.
+
+### Enigma2 not showing subtitles
+Go to Menu > Setup > Subtitles and enable DVB subtitles.
+Set the subtitle language to match your --lang setting.

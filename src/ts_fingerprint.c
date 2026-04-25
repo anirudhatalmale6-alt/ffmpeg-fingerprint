@@ -187,6 +187,198 @@ static int font_scale = 2; /* auto: 1 for SD, 2 for 1080p, 3 for 4K */
 /* Subtitle type: 0x10=normal, 0x20=hearing_impaired (auto-selects on some players) */
 static uint8_t subtitling_type = 0x10;
 
+/* ------------------------------------------------------------------ */
+/*  Real-time stream statistics (built-in ffprobe replacement)        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    /* Stream info from PMT */
+    uint8_t video_stream_type;
+    uint8_t audio_stream_type;
+    uint16_t stat_video_pid;
+    uint16_t stat_audio_pid;
+
+    /* Byte counters for bitrate */
+    uint64_t total_bytes;
+    uint64_t video_bytes;
+    uint64_t audio_bytes;
+    uint64_t bytes_window;
+    uint64_t video_bytes_window;
+    uint64_t audio_bytes_window;
+    time_t window_start;
+
+    /* Calculated rates (updated every second) */
+    double total_bitrate_kbps;
+    double video_bitrate_kbps;
+    double audio_bitrate_kbps;
+
+    /* FPS tracking from PTS */
+    int64_t prev_video_pts;
+    int64_t pts_diff_sum;
+    int pts_diff_count;
+    double current_fps;
+
+    /* Continuity counter error detection */
+    uint8_t last_cc[8192];
+    uint8_t cc_seen[8192];
+    uint64_t cc_errors;
+
+    /* Packet counts */
+    uint64_t total_packets;
+    uint64_t video_packets;
+    uint64_t audio_packets;
+
+    /* Uptime */
+    time_t start_time;
+
+    /* Stream health */
+    time_t last_data_time;
+
+    pthread_mutex_t mutex;
+} StreamStats;
+
+static StreamStats g_stats = {0};
+
+static const char *stream_type_name(uint8_t type) {
+    switch (type) {
+        case 0x01: return "MPEG-1";
+        case 0x02: return "MPEG-2";
+        case 0x1B: return "H.264";
+        case 0x24: return "H.265";
+        case 0x03: return "MP3";
+        case 0x04: return "MP3";
+        case 0x0F: return "AAC";
+        case 0x11: return "AAC-LATM";
+        case 0x81: return "AC3";
+        case 0x06: return "PES-private";
+        default:   return "unknown";
+    }
+}
+
+static void stats_init(void) {
+    memset(&g_stats, 0, sizeof(g_stats));
+    pthread_mutex_init(&g_stats.mutex, NULL);
+    g_stats.start_time = time(NULL);
+    g_stats.window_start = time(NULL);
+    g_stats.last_data_time = time(NULL);
+    g_stats.prev_video_pts = -1;
+}
+
+static void stats_update_bitrate(void) {
+    time_t now = time(NULL);
+    double elapsed = difftime(now, g_stats.window_start);
+    if (elapsed >= 1.0) {
+        g_stats.total_bitrate_kbps = (g_stats.bytes_window * 8.0) / (elapsed * 1000.0);
+        g_stats.video_bitrate_kbps = (g_stats.video_bytes_window * 8.0) / (elapsed * 1000.0);
+        g_stats.audio_bitrate_kbps = (g_stats.audio_bytes_window * 8.0) / (elapsed * 1000.0);
+        g_stats.bytes_window = 0;
+        g_stats.video_bytes_window = 0;
+        g_stats.audio_bytes_window = 0;
+        g_stats.window_start = now;
+    }
+}
+
+static void stats_count_packet(uint16_t pid, int payload_size) {
+    pthread_mutex_lock(&g_stats.mutex);
+    g_stats.total_packets++;
+    g_stats.total_bytes += payload_size;
+    g_stats.bytes_window += payload_size;
+    g_stats.last_data_time = time(NULL);
+
+    if (pid == g_stats.stat_video_pid && g_stats.stat_video_pid != 0) {
+        g_stats.video_packets++;
+        g_stats.video_bytes += payload_size;
+        g_stats.video_bytes_window += payload_size;
+    } else if (pid == g_stats.stat_audio_pid && g_stats.stat_audio_pid != 0) {
+        g_stats.audio_packets++;
+        g_stats.audio_bytes += payload_size;
+        g_stats.audio_bytes_window += payload_size;
+    }
+
+    stats_update_bitrate();
+    pthread_mutex_unlock(&g_stats.mutex);
+}
+
+static void stats_check_cc(uint16_t pid, uint8_t cc) {
+    if (pid >= 8192) return;
+    pthread_mutex_lock(&g_stats.mutex);
+    if (g_stats.cc_seen[pid]) {
+        uint8_t expected = (g_stats.last_cc[pid] + 1) & 0x0F;
+        if (cc != expected && cc != g_stats.last_cc[pid]) {
+            g_stats.cc_errors++;
+        }
+    }
+    g_stats.last_cc[pid] = cc;
+    g_stats.cc_seen[pid] = 1;
+    pthread_mutex_unlock(&g_stats.mutex);
+}
+
+static void stats_update_fps(int64_t pts) {
+    pthread_mutex_lock(&g_stats.mutex);
+    if (g_stats.prev_video_pts >= 0 && pts > g_stats.prev_video_pts) {
+        int64_t diff = pts - g_stats.prev_video_pts;
+        if (diff > 0 && diff < 180000) {
+            g_stats.pts_diff_sum += diff;
+            g_stats.pts_diff_count++;
+            if (g_stats.pts_diff_count >= 10) {
+                double avg_diff = (double)g_stats.pts_diff_sum / g_stats.pts_diff_count;
+                if (avg_diff > 0)
+                    g_stats.current_fps = 90000.0 / avg_diff;
+                g_stats.pts_diff_sum = 0;
+                g_stats.pts_diff_count = 0;
+            }
+        }
+    }
+    g_stats.prev_video_pts = pts;
+    pthread_mutex_unlock(&g_stats.mutex);
+}
+
+static int stats_format(char *buf, int bufsize) {
+    pthread_mutex_lock(&g_stats.mutex);
+    time_t now = time(NULL);
+    long uptime = (long)difftime(now, g_stats.start_time);
+    long hours = uptime / 3600;
+    long mins = (uptime % 3600) / 60;
+    long secs = uptime % 60;
+    double idle_secs = difftime(now, g_stats.last_data_time);
+
+    int n = snprintf(buf, bufsize,
+        "uptime=%ldh%02ldm%02lds "
+        "video_codec=%s video_pid=0x%04X "
+        "audio_codec=%s audio_pid=0x%04X "
+        "total_bitrate=%.0fkbps "
+        "video_bitrate=%.0fkbps "
+        "audio_bitrate=%.0fkbps "
+        "fps=%.1f "
+        "display=%dx%d "
+        "packets=%lu "
+        "video_packets=%lu "
+        "audio_packets=%lu "
+        "cc_errors=%lu "
+        "idle=%.0fs "
+        "fingerprint_active=%d "
+        "fingerprint_text=%s",
+        hours, mins, secs,
+        stream_type_name(g_stats.video_stream_type),
+        g_stats.stat_video_pid,
+        stream_type_name(g_stats.audio_stream_type),
+        g_stats.stat_audio_pid,
+        g_stats.total_bitrate_kbps,
+        g_stats.video_bitrate_kbps,
+        g_stats.audio_bitrate_kbps,
+        g_stats.current_fps,
+        display_width, display_height,
+        (unsigned long)g_stats.total_packets,
+        (unsigned long)g_stats.video_packets,
+        (unsigned long)g_stats.audio_packets,
+        (unsigned long)g_stats.cc_errors,
+        idle_secs,
+        g_state.active,
+        g_state.text);
+    pthread_mutex_unlock(&g_stats.mutex);
+    return n;
+}
+
 /* Position coordinates (scaled proportionally to display dimensions) */
 /* Format: {x_percent, y_percent} as percentage of video dimensions */
 static const int positions[9][2] = {
@@ -881,19 +1073,29 @@ static void parse_pmt(const uint8_t *ts_packet)
         int es_info_length = ((ts_packet[i + 3] & 0x0F) << 8) | ts_packet[i + 4];
 
         /* Video stream types: H.264=0x1B, H.265=0x24 */
-        if (stream_type == 0x1B || stream_type == 0x24 || stream_type == 0x02) {
+        if (stream_type == 0x1B || stream_type == 0x24 || stream_type == 0x02 || stream_type == 0x01) {
             video_pid = elem_pid;
+            g_stats.video_stream_type = stream_type;
         }
         /* Audio stream types */
         if (stream_type == 0x03 || stream_type == 0x04 || stream_type == 0x0F ||
             stream_type == 0x11 || stream_type == 0x81) {
-            if (audio_pid == 0) audio_pid = elem_pid;
+            if (audio_pid == 0) {
+                audio_pid = elem_pid;
+                g_stats.audio_stream_type = stream_type;
+            }
         }
 
         i += es_info_length; /* skip ES descriptors */
     }
 
     pmt_found = 1;
+
+    /* Update stats with stream info */
+    pthread_mutex_lock(&g_stats.mutex);
+    g_stats.stat_video_pid = video_pid;
+    g_stats.stat_audio_pid = audio_pid;
+    pthread_mutex_unlock(&g_stats.mutex);
 }
 
 /*
@@ -1114,6 +1316,59 @@ static void *zmq_thread_func(void *arg)
             snprintf(reply, sizeof(reply), "active=%d text=%s pos=%d",
                      g_state.active, g_state.text, g_state.position);
 
+        } else if (strcmp(buf, "STATS") == 0) {
+            char stats_buf[2048];
+            stats_format(stats_buf, sizeof(stats_buf));
+            zmq_send(zmq_socket, stats_buf, strlen(stats_buf), 0);
+            pthread_mutex_unlock(&g_state.mutex);
+            continue;
+
+        } else if (strcmp(buf, "STATS_JSON") == 0) {
+            pthread_mutex_lock(&g_stats.mutex);
+            time_t now = time(NULL);
+            long uptime = (long)difftime(now, g_stats.start_time);
+            double idle_secs = difftime(now, g_stats.last_data_time);
+            char json_buf[4096];
+            snprintf(json_buf, sizeof(json_buf),
+                "{\"uptime_seconds\":%ld,"
+                "\"video_codec\":\"%s\",\"video_pid\":%d,"
+                "\"audio_codec\":\"%s\",\"audio_pid\":%d,"
+                "\"total_bitrate_kbps\":%.0f,"
+                "\"video_bitrate_kbps\":%.0f,"
+                "\"audio_bitrate_kbps\":%.0f,"
+                "\"fps\":%.1f,"
+                "\"display_width\":%d,\"display_height\":%d,"
+                "\"total_packets\":%lu,"
+                "\"video_packets\":%lu,"
+                "\"audio_packets\":%lu,"
+                "\"cc_errors\":%lu,"
+                "\"idle_seconds\":%.0f,"
+                "\"stream_healthy\":%s,"
+                "\"fingerprint_active\":%s,"
+                "\"fingerprint_text\":\"%s\"}",
+                uptime,
+                stream_type_name(g_stats.video_stream_type),
+                g_stats.stat_video_pid,
+                stream_type_name(g_stats.audio_stream_type),
+                g_stats.stat_audio_pid,
+                g_stats.total_bitrate_kbps,
+                g_stats.video_bitrate_kbps,
+                g_stats.audio_bitrate_kbps,
+                g_stats.current_fps,
+                display_width, display_height,
+                (unsigned long)g_stats.total_packets,
+                (unsigned long)g_stats.video_packets,
+                (unsigned long)g_stats.audio_packets,
+                (unsigned long)g_stats.cc_errors,
+                idle_secs,
+                idle_secs < 5.0 ? "true" : "false",
+                g_state.active ? "true" : "false",
+                g_state.text);
+            pthread_mutex_unlock(&g_stats.mutex);
+            zmq_send(zmq_socket, json_buf, strlen(json_buf), 0);
+            pthread_mutex_unlock(&g_state.mutex);
+            continue;
+
         } else {
             snprintf(reply, sizeof(reply), "ERR unknown command");
         }
@@ -1213,15 +1468,17 @@ static int inject_subtitle(int64_t video_pts, int *last_active,
 /*  Main processing loop                                              */
 /* ------------------------------------------------------------------ */
 
+static int stats_stderr_interval = 0;
+
 static void print_usage(const char *progname)
 {
     fprintf(stderr,
         "Usage: %s [options]\n"
         "\n"
         "Reads MPEG-TS from stdin, injects DVB subtitle fingerprint,\n"
-        "writes MPEG-TS to stdout.\n"
+        "writes MPEG-TS to stdout. Built-in stream statistics (no ffprobe needed).\n"
         "\n"
-        "Options:\n"
+        "Fingerprint Options:\n"
         "  --zmq ADDR       ZeroMQ bind address (default: tcp://127.0.0.1:5556)\n"
         "  --text TEXT       Initial fingerprint text\n"
         "  --position N     Position 0-8 (-1=random, default=-1)\n"
@@ -1230,19 +1487,30 @@ static void print_usage(const char *progname)
         "                   Use 720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K\n"
         "  --fontscale N    Font scale factor 1-4 (default: auto based on display)\n"
         "  --forced         Mark subtitle as hearing-impaired (auto-selects on some players)\n"
-        "  --help           Show this help\n"
+        "\n"
+        "Stream Statistics (built-in ffprobe):\n"
+        "  --stats N        Print stream stats to stderr every N seconds (0=off)\n"
+        "                   Stats also available via ZMQ STATS/STATS_JSON commands\n"
         "\n"
         "ZMQ Commands:\n"
         "  SHOW <text>          Show fingerprint\n"
         "  SHOW <text> <pos>    Show at position (0-8)\n"
         "  HIDE                 Hide fingerprint\n"
-        "  STATUS               Get current state\n"
+        "  STATUS               Get fingerprint state\n"
+        "  STATS                Get real-time stream statistics (text format)\n"
+        "  STATS_JSON           Get real-time stream statistics (JSON format)\n"
         "\n"
-        "Example:\n"
+        "Examples:\n"
+        "  # Basic fingerprint with stream monitoring:\n"
         "  ffmpeg -i input -c:v copy -c:a copy -f mpegts pipe:1 | \\\n"
-        "    %s --zmq tcp://127.0.0.1:5556 | \\\n"
+        "    %s --zmq tcp://127.0.0.1:5556 --stats 10 | \\\n"
         "    ffmpeg -i pipe:0 -c copy -f flv rtmp://server/live/key\n"
-        "\n", progname, progname);
+        "\n"
+        "  # VLC auto-display (pipe output through ffmpeg with disposition):\n"
+        "  ffmpeg -i input -c:v copy -c:a copy -f mpegts pipe:1 | \\\n"
+        "    %s --forced --lang eng | \\\n"
+        "    ffmpeg -i pipe:0 -c copy -disposition:s:0 default -f mpegts pipe:1\n"
+        "\n", progname, progname, progname);
 }
 
 int main(int argc, char *argv[])
@@ -1277,6 +1545,8 @@ int main(int argc, char *argv[])
             if (font_scale > 4) font_scale = 4;
         } else if (strcmp(argv[i], "--forced") == 0) {
             subtitling_type = 0x20;
+        } else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) {
+            stats_stderr_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -1286,6 +1556,9 @@ int main(int argc, char *argv[])
             return 1;
         }
     }
+
+    /* Initialize stats tracking */
+    stats_init();
 
     /* Set initial state */
     pthread_mutex_init(&g_state.mutex, NULL);
@@ -1366,6 +1639,15 @@ int main(int argc, char *argv[])
         /* Get PID */
         uint16_t pid = ((ts_packet[1] & 0x1F) << 8) | ts_packet[2];
 
+        /* Stats: count packet and check continuity */
+        {
+            uint8_t cc = ts_packet[3] & 0x0F;
+            int has_payload = (ts_packet[3] >> 4) & 0x01;
+            if (has_payload && pid != TS_NULL_PID)
+                stats_check_cc(pid, cc);
+            stats_count_packet(pid, TS_PACKET_SIZE);
+        }
+
         /* Parse PAT */
         if (pid == TS_PAT_PID) {
             parse_pat(ts_packet);
@@ -1420,6 +1702,7 @@ int main(int argc, char *argv[])
                     if (extract_pes_pts(ts_packet + payload_offset, pes_len, &pts)) {
                         last_video_pts = pts;
                         have_video_pts = 1;
+                        stats_update_fps(pts);
                     }
                 }
             }
@@ -1445,6 +1728,19 @@ int main(int argc, char *argv[])
         if (packets_since_inject >= INJECT_INTERVAL_PACKETS && have_video_pts && pmt_found) {
             packets_since_inject = 0;
             inject_subtitle(last_video_pts, &last_active, &first_display_done);
+        }
+
+        /* Periodic stats output to stderr */
+        if (stats_stderr_interval > 0) {
+            static time_t last_stats_print = 0;
+            time_t now = time(NULL);
+            if (last_stats_print == 0) last_stats_print = now;
+            if (difftime(now, last_stats_print) >= stats_stderr_interval) {
+                char stats_buf[2048];
+                stats_format(stats_buf, sizeof(stats_buf));
+                fprintf(stderr, "[ts_fingerprint] %s\n", stats_buf);
+                last_stats_print = now;
+            }
         }
     }
 
