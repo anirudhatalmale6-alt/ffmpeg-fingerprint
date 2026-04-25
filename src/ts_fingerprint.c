@@ -35,6 +35,7 @@
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
+#include "embedded_font.h"
 
 /* ------------------------------------------------------------------ */
 /*  MPEG-TS Constants                                                 */
@@ -191,10 +192,11 @@ static int font_scale = 2; /* auto: 1 for SD, 2 for 1080p, 3 for 4K */
 /* Subtitle type: 0x10=normal, 0x20=hearing_impaired (auto-selects on some players) */
 static uint8_t subtitling_type = 0x10;
 
-/* TTF font support (optional, falls back to built-in bitmap font) */
+/* TTF font support */
 static uint8_t *ttf_font_data = NULL;
 static stbtt_fontinfo ttf_font_info;
 static int ttf_font_loaded = 0;
+static int ttf_font_is_external = 0;
 
 static int load_ttf_font(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -205,6 +207,7 @@ static int load_ttf_font(const char *path) {
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (ttf_font_data && ttf_font_is_external) free(ttf_font_data);
     ttf_font_data = malloc(size);
     if (!ttf_font_data) { fclose(f); return -1; }
     if (fread(ttf_font_data, 1, size, f) != (size_t)size) {
@@ -221,8 +224,20 @@ static int load_ttf_font(const char *path) {
         return -1;
     }
     ttf_font_loaded = 1;
+    ttf_font_is_external = 1;
     fprintf(stderr, "[ts_fingerprint] Loaded TTF font: %s\n", path);
     return 0;
+}
+
+static void load_embedded_font(void) {
+    if (!stbtt_InitFont(&ttf_font_info, embedded_ttf_data,
+                        stbtt_GetFontOffsetForIndex(embedded_ttf_data, 0))) {
+        fprintf(stderr, "[ts_fingerprint] Warning: embedded font init failed, using bitmap fallback\n");
+        return;
+    }
+    ttf_font_loaded = 1;
+    ttf_font_is_external = 0;
+    fprintf(stderr, "[ts_fingerprint] Using built-in TTF font (dash)\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1602,7 +1617,7 @@ static void print_usage(const char *progname)
         "  --display WxH    Display resolution (default: 1920x1080)\n"
         "                   Use 720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K\n"
         "  --fontscale N    Font scale factor 1-4 (default: auto based on display)\n"
-        "  --font FILE      Use custom TTF font instead of built-in bitmap font\n"
+        "  --font FILE      Use custom TTF font (default: embedded dash font)\n"
         "  --forced         Mark subtitle as hearing-impaired (auto-selects on some players)\n"
         "\n"
         "Stream Statistics (built-in ffprobe):\n"
@@ -1635,6 +1650,9 @@ int main(int argc, char *argv[])
     const char *zmq_addr = "tcp://127.0.0.1:5556";
     const char *initial_text = NULL;
     int initial_pos = -1;
+
+    /* Load embedded TTF font as default (--font overrides this) */
+    load_embedded_font();
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -1873,7 +1891,7 @@ done:
     zmq_ctx_destroy(zmq_ctx);
     pthread_mutex_destroy(&g_state.mutex);
     pthread_mutex_destroy(&g_stats.mutex);
-    if (ttf_font_data) free(ttf_font_data);
+    if (ttf_font_data && ttf_font_is_external) free(ttf_font_data);
 
     return 0;
 }
