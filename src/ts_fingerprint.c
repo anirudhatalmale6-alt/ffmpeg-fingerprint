@@ -184,6 +184,9 @@ static int display_width = 1920;
 static int display_height = 1080;
 static int font_scale = 2; /* auto: 1 for SD, 2 for 1080p, 3 for 4K */
 
+/* Subtitle type: 0x10=normal, 0x20=hearing_impaired (auto-selects on some players) */
+static uint8_t subtitling_type = 0x10;
+
 /* Position coordinates (scaled proportionally to display dimensions) */
 /* Format: {x_percent, y_percent} as percentage of video dimensions */
 static const int positions[9][2] = {
@@ -962,7 +965,7 @@ static int build_modified_pmt(uint8_t *out_ts)
     out_ts[p++] = subtitle_lang[0]; /* ISO 639 language code (configurable via --lang) */
     out_ts[p++] = subtitle_lang[1];
     out_ts[p++] = subtitle_lang[2];
-    out_ts[p++] = 0x10;  /* subtitling_type: normal DVB */
+    out_ts[p++] = subtitling_type; /* subtitling_type: 0x10=normal, 0x20=hearing_impaired */
     out_ts[p++] = 0x00;  /* composition_page_id high */
     out_ts[p++] = 0x01;  /* composition_page_id low */
     out_ts[p++] = 0x00;  /* ancillary_page_id high */
@@ -1226,6 +1229,7 @@ static void print_usage(const char *progname)
         "  --display WxH    Display resolution (default: 1920x1080)\n"
         "                   Use 720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K\n"
         "  --fontscale N    Font scale factor 1-4 (default: auto based on display)\n"
+        "  --forced         Mark subtitle as hearing-impaired (auto-selects on some players)\n"
         "  --help           Show this help\n"
         "\n"
         "ZMQ Commands:\n"
@@ -1271,6 +1275,8 @@ int main(int argc, char *argv[])
             font_scale = atoi(argv[++i]);
             if (font_scale < 1) font_scale = 1;
             if (font_scale > 4) font_scale = 4;
+        } else if (strcmp(argv[i], "--forced") == 0) {
+            subtitling_type = 0x20;
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
