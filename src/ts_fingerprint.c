@@ -403,13 +403,27 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     /* Calculate position first (needed for bitmap rendering) */
     int vid_w = display_width, vid_h = display_height;
     int pos_x, pos_y;
+
+    /* Pre-calculate text pixel size for bounds clamping */
+    int text_len = strlen(text);
+    int text_pixel_w = text_len * 8 * font_scale + 4 * font_scale * 2;
+    int text_pixel_h = 16 * font_scale + 4 * font_scale * 2;
+
     if (position >= 0 && position <= 8) {
         pos_x = (positions[position][0] * vid_w) / 100;
         pos_y = (positions[position][1] * vid_h) / 100;
     } else {
-        srand(time(NULL));
-        pos_x = (positions[rand() % 9][0] * vid_w) / 100;
-        pos_y = (positions[rand() % 9][1] * vid_h) / 100;
+        /* Truly random position anywhere on screen */
+        static unsigned int rand_state = 0;
+        if (rand_state == 0) rand_state = (unsigned int)time(NULL);
+        rand_state = rand_state * 1103515245 + 12345;
+        int max_x = vid_w - text_pixel_w;
+        int max_y = vid_h - text_pixel_h;
+        if (max_x < 10) max_x = 10;
+        if (max_y < 10) max_y = 10;
+        pos_x = (rand_state >> 16) % max_x;
+        rand_state = rand_state * 1103515245 + 12345;
+        pos_y = (rand_state >> 16) % max_y;
     }
 
     /* Render text into full-width bitmap (position baked in for MAG compat) */
