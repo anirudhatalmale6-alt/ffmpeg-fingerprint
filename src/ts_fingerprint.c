@@ -727,6 +727,7 @@ static int build_dvb_subtitle_pes(const char *text, int position,
                                    uint8_t **out_buf, int *out_size)
 {
     static uint8_t page_version = 0;
+    static uint8_t clut_version = 1;
 
     /* Calculate position first (needed for bitmap rendering) */
     int vid_w = display_width, vid_h = display_height;
@@ -858,43 +859,35 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     put_be16(pes + p, 0); p += 2;
     int cds_start = p;
     pes[p++] = 0x00; /* CLUT_id = 0 */
-    pes[p++] = 0x00; /* CLUT_version_number(4b)=0 + reserved(4b) */
+    pes[p++] = ((clut_version & 0x0F) << 4) | 0x07; /* CLUT_version + reserved */
+    clut_version = (clut_version + 1) & 0x0F;
+    if (clut_version == 0) clut_version = 1;
     /*
-     * CLUT entry flags byte:
-     *   bit 7: 2-bit/entry_CLUT_flag
-     *   bit 6: 4-bit/entry_CLUT_flag
-     *   bit 5: 8-bit/entry_CLUT_flag
-     *   bits 4-1: reserved
-     *   bit 0: full_range_flag (1=Y,Cr,Cb,T each 8 bits)
-     * We use 4-bit CLUT with full range = 0x41
+     * FFmpeg DVB subtitle decoder transparency convention:
+     *   T = 0x00 means fully OPAQUE
+     *   T = 0xFF means fully TRANSPARENT
      */
-    /*
-     * CLUT entries - indices match render_text_bitmap():
-     *   0 = not used in pixel data (but define as transparent for safety)
-     *   1 = semi-transparent black background
-     *   2 = white text (fully opaque)
-     */
-    /* Entry 0: transparent (default/unused) */
+    /* Entry 0: fully transparent (background/unused) */
     pes[p++] = 0x00; /* CLUT_entry_id = 0 */
     pes[p++] = 0x21; /* 8-bit CLUT flag + full_range */
     pes[p++] = 0x00; /* Y = 0 */
     pes[p++] = 0x80; /* Cr = 128 (neutral) */
     pes[p++] = 0x80; /* Cb = 128 (neutral) */
-    pes[p++] = 0x00; /* T = 0 (fully transparent) */
+    pes[p++] = 0xFF; /* T = 0xFF (fully transparent) */
     /* Entry 1: semi-transparent black background */
     pes[p++] = 0x01; /* CLUT_entry_id = 1 */
     pes[p++] = 0x21; /* 8-bit CLUT flag + full_range */
     pes[p++] = 0x10; /* Y = 16 (black in BT.601) */
     pes[p++] = 0x80; /* Cr = 128 (neutral) */
     pes[p++] = 0x80; /* Cb = 128 (neutral) */
-    pes[p++] = 0x80; /* T = 128 (semi-transparent) */
-    /* Entry 2: white text */
+    pes[p++] = 0x80; /* T = 0x80 (semi-transparent) */
+    /* Entry 2: white text (fully opaque) */
     pes[p++] = 0x02; /* CLUT_entry_id = 2 */
     pes[p++] = 0x21; /* 8-bit CLUT flag + full_range */
     pes[p++] = 0xEB; /* Y = 235 (white in BT.601) */
     pes[p++] = 0x80; /* Cr = 128 (neutral) */
     pes[p++] = 0x80; /* Cb = 128 (neutral) */
-    pes[p++] = 0xFF; /* T = 255 (fully opaque) */
+    pes[p++] = 0x00; /* T = 0x00 (fully opaque) */
     put_be16(pes + cds_len_pos, p - cds_start);
 
     /* --- Object Data Segment --- */
