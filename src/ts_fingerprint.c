@@ -972,10 +972,15 @@ static int build_dvb_subtitle_clear(int page_id, uint8_t **out_buf, int *out_siz
 }
 
 /* ------------------------------------------------------------------ */
-/*  CEA-608 Closed Caption Injection (for ExoPlayer/IPTV apps)        */
+/*  CEA-608/708 Closed Caption Injection (for ExoPlayer/IPTV apps)    */
+/*                                                                    */
+/*  Injects both CEA-608 (backwards compat) and CEA-708 (DTVCC) into */
+/*  H.264 SEI NAL units. CEA-708 uses DefineWindow with random       */
+/*  anchor positioning for anti-tamper. Both ride in the same SEI.    */
 /* ------------------------------------------------------------------ */
 
-static int cc608_enabled = 0;
+static int cc_enabled = 0;
+static uint8_t dtvcc_seq = 0;
 
 static uint8_t cc608_parity(uint8_t c)
 {
@@ -986,117 +991,165 @@ static uint8_t cc608_parity(uint8_t c)
 }
 
 /*
- * Build a CEA-608 SEI NAL unit for H.264 (annex-B format with start code).
- * Encodes the fingerprint text as roll-up captions at the bottom of the screen.
+ * Build a combined CEA-608 + CEA-708 SEI NAL unit (annex-B with start code).
  *
- * SEI payload structure (ATSC A/53 / A/72):
- *   payload_type = 4 (user_data_registered_itu_t_t35)
- *   country_code = 0xB5 (US)
- *   provider_code = 0x0031 (ATSC)
- *   user_identifier = "GA94"
- *   user_data_type_code = 0x03 (cc_data)
- *   cc_data triplets with CEA-608 field 1 data
+ * CEA-608: roll-up captions at bottom row (backwards compatibility).
+ * CEA-708: DTVCC DefineWindow with random relative anchor position.
+ *
+ * Both are carried as cc_data triplets in the same ATSC A/53 GA94 SEI.
+ * Devices that support 708 use the positioned window; older 608-only
+ * devices fall back to the fixed bottom-row text.
  */
-static int build_cc608_sei(const char *text, uint8_t **out_buf, int *out_size)
+static int build_cc_sei(const char *text, unsigned int rand_seed,
+                        uint8_t **out_buf, int *out_size)
 {
-    int text_len = strlen(text);
+    int text_len = (int)strlen(text);
     if (text_len > 32) text_len = 32;
 
-    /*
-     * CEA-608 command sequence (roll-up 2 lines, row 15):
-     *   1. EDM (erase displayed memory): clear screen
-     *   2. RU2 (roll-up 2 rows mode)
-     *   3. PAC row 15, indent 0 (bottom left)
-     *   4. Text character pairs
-     *   5. Padding null pairs to fill cc_count
-     */
-    int char_pairs = (text_len + 1) / 2;
-    int cc_count = 3 + char_pairs;
-    if (cc_count > 31) cc_count = 31;
+    /* === Build CEA-708 DTVCC packet === */
+    uint8_t dtvcc[128];
+    int d = 0;
 
-    /* Build cc_data triplets */
-    int triplets_size = cc_count * 3;
-    uint8_t *triplets = malloc(triplets_size);
-    if (!triplets) return -1;
+    /* Packet header (sequence + packet_size_code, filled after sizing) */
+    int pkt_hdr_idx = d++;
 
-    int t = 0;
-    /* Triplet 1: EDM (erase displayed memory) - 0x14, 0x2C */
-    triplets[t++] = 0xFC; /* cc_valid=1, cc_type=00 (field 1) */
-    triplets[t++] = cc608_parity(0x14);
-    triplets[t++] = cc608_parity(0x2C);
+    /* Service block 1: service 1, commands + first text chunk */
+    int svc1_hdr_idx = d++;
 
-    /* Triplet 2: RU2 (roll-up 2 rows) - 0x14, 0x25 */
-    triplets[t++] = 0xFC;
-    triplets[t++] = cc608_parity(0x14);
-    triplets[t++] = cc608_parity(0x25);
+    /* DeleteWindows: remove window 0 before redefining at new position */
+    dtvcc[d++] = 0x8C;
+    dtvcc[d++] = 0x01;
 
-    /* Triplet 3: PAC row 15, indent 0, white - 0x17, 0x60 */
-    triplets[t++] = 0xFC;
-    triplets[t++] = cc608_parity(0x17);
-    triplets[t++] = cc608_parity(0x60);
+    /* DefineWindow0 with random relative position (anti-tamper) */
+    unsigned int s = rand_seed;
+    s = (s * 1103515245u + 12345u) & 0x7FFFFFFFu;
+    int rand_v = 5 + (int)(s % 71);        /* 5-75% vertical */
+    s = (s * 1103515245u + 12345u) & 0x7FFFFFFFu;
+    int rand_h = 5 + (int)(s % 56);        /* 5-60% horizontal */
 
-    /* Text character pairs */
-    for (int i = 0; i < text_len && t < triplets_size; i += 2) {
-        triplets[t++] = 0xFC;
-        triplets[t++] = cc608_parity((uint8_t)text[i]);
-        if (i + 1 < text_len)
-            triplets[t++] = cc608_parity((uint8_t)text[i + 1]);
-        else
-            triplets[t++] = cc608_parity(0x20); /* pad with space */
+    dtvcc[d++] = 0x98; /* DefineWindow0 */
+    dtvcc[d++] = 0x20 | 0x07;              /* visible=1, priority=7 */
+    dtvcc[d++] = 0x80 | (rand_v & 0x7F);   /* relative_pos=1, anchor_v */
+    dtvcc[d++] = (uint8_t)(rand_h & 0xFF);  /* anchor_h */
+    dtvcc[d++] = 0x00;                      /* anchor_point=0, row_count=0 (1 row) */
+    {
+        int cc = (text_len > 1) ? (text_len - 1) : 0;
+        if (cc > 41) cc = 41;
+        dtvcc[d++] = (uint8_t)(cc & 0x3F);  /* col_count */
+    }
+    dtvcc[d++] = (3 << 3) | 1;             /* window_style=3 (translucent bg), pen_style=1 */
+
+    /* Text chars in service block 1 (max 22: block_size limit 31 - 9 cmd bytes) */
+    int text_blk1 = (text_len <= 22) ? text_len : 22;
+    for (int i = 0; i < text_blk1; i++) {
+        uint8_t ch = (uint8_t)text[i];
+        dtvcc[d++] = (ch >= 0x20 && ch <= 0x7E) ? ch : 0x20;
+    }
+    dtvcc[svc1_hdr_idx] = (uint8_t)((1 << 5) | ((d - svc1_hdr_idx - 1) & 0x1F));
+
+    /* Service block 2 for overflow text */
+    if (text_blk1 < text_len) {
+        int svc2_hdr_idx = d++;
+        int text_blk2 = text_len - text_blk1;
+        for (int i = text_blk1; i < text_len; i++) {
+            uint8_t ch = (uint8_t)text[i];
+            dtvcc[d++] = (ch >= 0x20 && ch <= 0x7E) ? ch : 0x20;
+        }
+        dtvcc[svc2_hdr_idx] = (uint8_t)((1 << 5) | (text_blk2 & 0x1F));
     }
 
-    /*
-     * Build SEI RBSP:
-     *   payload_type(1) + payload_size(1) + country_code(1) + provider_code(2)
-     *   + user_id(4) + type_code(1) + cc_header(1) + em_data(1) + triplets + marker(1)
-     *   + RBSP trailing(1)
-     */
+    /* Pad to even byte count */
+    if (d % 2 != 0)
+        dtvcc[d++] = 0x00;
+
+    /* Fill packet header */
+    int pkt_size_code = d / 2;
+    if (pkt_size_code > 63) pkt_size_code = 63;
+    dtvcc[pkt_hdr_idx] = (uint8_t)(((dtvcc_seq & 0x03) << 6) | (pkt_size_code & 0x3F));
+    dtvcc_seq = (dtvcc_seq + 1) & 0x03;
+
+    int dtvcc_bytes = d;
+    int dtvcc_triplets = dtvcc_bytes / 2;
+
+    /* === Determine CEA-608 triplet allocation === */
+    int cc608_text_pairs = (text_len + 1) / 2;
+    int cc608_max_pairs = 31 - dtvcc_triplets - 3;
+    if (cc608_max_pairs < 0) cc608_max_pairs = 0;
+    if (cc608_text_pairs > cc608_max_pairs) cc608_text_pairs = cc608_max_pairs;
+    int cc608_count = 3 + cc608_text_pairs;
+    int total_cc_count = cc608_count + dtvcc_triplets;
+    if (total_cc_count > 31) total_cc_count = 31;
+
+    /* === Build all cc_data triplets === */
+    int triplets_size = total_cc_count * 3;
+    uint8_t *triplets = malloc(triplets_size);
+    if (!triplets) return -1;
+    int t = 0;
+
+    /* CEA-608 triplets (cc_type=0b00, field 1) */
+    triplets[t++] = 0xFC; triplets[t++] = cc608_parity(0x14); triplets[t++] = cc608_parity(0x2C);
+    triplets[t++] = 0xFC; triplets[t++] = cc608_parity(0x14); triplets[t++] = cc608_parity(0x25);
+    triplets[t++] = 0xFC; triplets[t++] = cc608_parity(0x17); triplets[t++] = cc608_parity(0x60);
+
+    int text_608_len = cc608_text_pairs * 2;
+    if (text_608_len > text_len) text_608_len = text_len;
+    for (int i = 0; i < text_608_len && (t / 3) < cc608_count; i += 2) {
+        triplets[t++] = 0xFC;
+        triplets[t++] = cc608_parity((uint8_t)text[i]);
+        triplets[t++] = (i + 1 < text_608_len)
+            ? cc608_parity((uint8_t)text[i + 1])
+            : cc608_parity(0x20);
+    }
+
+    /* CEA-708 DTVCC triplets: first = start (0xFF), rest = data (0xFE) */
+    triplets[t++] = 0xFF;
+    triplets[t++] = dtvcc[0];
+    triplets[t++] = dtvcc[1];
+    for (int i = 2; i < dtvcc_bytes; i += 2) {
+        triplets[t++] = 0xFE;
+        triplets[t++] = dtvcc[i];
+        triplets[t++] = (i + 1 < dtvcc_bytes) ? dtvcc[i + 1] : 0x00;
+    }
+
+    /* === Build SEI RBSP === */
     int payload_data_size = 1 + 2 + 4 + 1 + 1 + 1 + t + 1;
-    int sei_rbsp_size = 1 + 1 + payload_data_size + 1;
-    uint8_t *sei_rbsp = malloc(sei_rbsp_size + 16);
+    int sei_rbsp_max = 2 + (payload_data_size / 255 + 1) + payload_data_size + 2;
+    uint8_t *sei_rbsp = malloc(sei_rbsp_max);
     if (!sei_rbsp) { free(triplets); return -1; }
 
     int p = 0;
     sei_rbsp[p++] = 4; /* payload_type = user_data_registered_itu_t_t35 */
-    sei_rbsp[p++] = (uint8_t)payload_data_size;
-    sei_rbsp[p++] = 0xB5; /* country_code = United States */
-    sei_rbsp[p++] = 0x00; /* provider_code high = ATSC */
-    sei_rbsp[p++] = 0x31; /* provider_code low */
-    sei_rbsp[p++] = 0x47; /* 'G' */
-    sei_rbsp[p++] = 0x41; /* 'A' */
-    sei_rbsp[p++] = 0x39; /* '9' */
-    sei_rbsp[p++] = 0x34; /* '4' */
-    sei_rbsp[p++] = 0x03; /* user_data_type_code = cc_data */
-    sei_rbsp[p++] = 0xC0 | (cc_count & 0x1F); /* process_cc_data=1, zero=1, cc_count */
-    sei_rbsp[p++] = 0xFF; /* em_data */
+    { int rem = payload_data_size; while (rem > 254) { sei_rbsp[p++] = 0xFF; rem -= 255; } sei_rbsp[p++] = (uint8_t)rem; }
+    sei_rbsp[p++] = 0xB5;                 /* country_code = US */
+    sei_rbsp[p++] = 0x00; sei_rbsp[p++] = 0x31; /* provider_code = ATSC */
+    sei_rbsp[p++] = 'G'; sei_rbsp[p++] = 'A'; sei_rbsp[p++] = '9'; sei_rbsp[p++] = '4';
+    sei_rbsp[p++] = 0x03;                 /* user_data_type_code = cc_data */
+    sei_rbsp[p++] = 0xC0 | (total_cc_count & 0x1F);
+    sei_rbsp[p++] = 0xFF;                 /* em_data */
     memcpy(sei_rbsp + p, triplets, t); p += t;
-    sei_rbsp[p++] = 0xFF; /* marker_bits */
-    sei_rbsp[p++] = 0x80; /* RBSP trailing bits */
+    sei_rbsp[p++] = 0xFF;                 /* marker_bits */
+    sei_rbsp[p++] = 0x80;                 /* RBSP trailing */
 
     int rbsp_size = p;
     free(triplets);
 
-    /* Build complete NAL unit with start code + emulation prevention */
-    int max_nal_size = 4 + 1 + rbsp_size * 3 / 2 + 4;
+    /* Build annex-B NAL with emulation prevention */
+    int max_nal_size = 4 + 1 + rbsp_size * 2 + 4;
     uint8_t *nal = malloc(max_nal_size);
     if (!nal) { free(sei_rbsp); return -1; }
 
     int np = 0;
-    nal[np++] = 0x00;
-    nal[np++] = 0x00;
-    nal[np++] = 0x00;
-    nal[np++] = 0x01;
+    nal[np++] = 0x00; nal[np++] = 0x00; nal[np++] = 0x00; nal[np++] = 0x01;
     nal[np++] = 0x06; /* NAL type = SEI */
 
     int zero_count = 0;
     for (int i = 0; i < rbsp_size; i++) {
         if (zero_count >= 2 && sei_rbsp[i] <= 0x03) {
-            nal[np++] = 0x03; /* emulation prevention byte */
+            nal[np++] = 0x03;
             zero_count = 0;
         }
         nal[np++] = sei_rbsp[i];
-        if (sei_rbsp[i] == 0x00) zero_count++;
-        else zero_count = 0;
+        zero_count = (sei_rbsp[i] == 0x00) ? zero_count + 1 : 0;
     }
 
     free(sei_rbsp);
@@ -1106,21 +1159,19 @@ static int build_cc608_sei(const char *text, uint8_t **out_buf, int *out_size)
 }
 
 /*
- * Inject CEA-608 SEI NAL into a video PES start TS packet.
- * Modifies the packet in-place and returns any overflow TS packets.
- *
- * Strategy: insert the SEI NAL data after the PES header, before the video NALs.
- * If the data doesn't fit in one TS packet, emit extra continuation packets.
+ * Inject CEA-608/708 SEI NAL into a video PES start TS packet.
+ * Inserts SEI before the first slice NAL. Emits extra continuation
+ * TS packets for overflow data.
  *
  * Returns: number of extra TS packets written to stdout (0 or more)
  */
-static int inject_cc608_into_video_ts(uint8_t *ts_packet, const char *text,
-                                       uint8_t *video_cc_ptr)
+static int inject_cc_into_video_ts(uint8_t *ts_packet, const char *text,
+                                    uint8_t *video_cc_ptr, unsigned int rand_seed)
 {
     uint8_t *sei_nal = NULL;
     int sei_size = 0;
 
-    if (build_cc608_sei(text, &sei_nal, &sei_size) != 0)
+    if (build_cc_sei(text, rand_seed, &sei_nal, &sei_size) != 0)
         return 0;
 
     /* Parse TS header */
@@ -1908,7 +1959,9 @@ static void print_usage(const char *progname)
         "  --forced         Mark subtitle as hearing-impaired (auto-selects on some players)\n"
         "  --inject-interval N  Subtitle re-injection interval in seconds (default: 8)\n"
         "                   Lower = faster display on channel join, Higher = less overhead\n"
-        "  --cc608          Also inject CEA-608 closed captions into H.264 video stream\n"
+        "  --cc             Inject CEA-608+708 closed captions into H.264 video stream\n"
+        "                   CEA-708: random window positioning (anti-tamper)\n"
+        "                   CEA-608: fixed bottom row (backwards compatibility)\n"
         "                   Auto-displays on ExoPlayer apps (iboPlayer, TiviMate, etc.)\n"
         "                   Zero re-encoding - injects SEI NAL units into existing video\n"
         "\n"
@@ -1980,8 +2033,8 @@ int main(int argc, char *argv[])
             inject_interval_sec = atoi(argv[++i]);
             if (inject_interval_sec < 2) inject_interval_sec = 2;
             if (inject_interval_sec > 30) inject_interval_sec = 30;
-        } else if (strcmp(argv[i], "--cc608") == 0) {
-            cc608_enabled = 1;
+        } else if (strcmp(argv[i], "--cc") == 0 || strcmp(argv[i], "--cc608") == 0) {
+            cc_enabled = 1;
         } else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) {
             stats_stderr_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -2041,12 +2094,14 @@ int main(int argc, char *argv[])
     int needs_immediate_inject = 0;   /* set when text changes or first SHOW */
     int prev_active_state = 0;        /* track state changes */
     char prev_text[MAX_TEXT_LEN] = "";
-    uint8_t video_cc_tracker = 0;     /* track video PID CC for CEA-608 extra packets */
-    time_t last_cc608_inject_time = 0;
+    uint8_t video_cc_tracker = 0;     /* track video PID CC for CC injection extra packets */
+    time_t last_cc_inject_time = 0;
     (void)pat_cc;
 
-    if (cc608_enabled) {
-        fprintf(stderr, "[ts_fingerprint] CEA-608 closed captions: ENABLED (ExoPlayer/IPTV apps)\n");
+    if (cc_enabled) {
+        fprintf(stderr, "[ts_fingerprint] CEA-608+708 closed captions: ENABLED\n");
+        fprintf(stderr, "[ts_fingerprint]   CEA-708: random window positioning (anti-tamper)\n");
+        fprintf(stderr, "[ts_fingerprint]   CEA-608: fixed bottom row (backwards compat)\n");
     }
     fprintf(stderr, "[ts_fingerprint] Processing MPEG-TS stream...\n");
 
@@ -2124,7 +2179,7 @@ int main(int argc, char *argv[])
             int payload_start = (ts_packet[1] & 0x40) != 0;
             int keyframe_detected = 0;
 
-            /* Track video continuity counter for CEA-608 extra packets */
+            /* Track video continuity counter for CC injection extra packets */
             video_cc_tracker = ts_packet[3] & 0x0F;
 
             /* Check for random access indicator (keyframe) */
@@ -2168,11 +2223,11 @@ int main(int argc, char *argv[])
                 }
             }
 
-            /* CEA-608 closed caption injection at keyframes */
-            if (cc608_enabled && keyframe_detected && payload_start && g_state.active) {
+            /* CEA-608+708 closed caption injection at keyframes */
+            if (cc_enabled && keyframe_detected && payload_start && g_state.active) {
                 time_t now = time(NULL);
-                if (last_cc608_inject_time == 0 ||
-                    difftime(now, last_cc608_inject_time) >= inject_interval_sec) {
+                if (last_cc_inject_time == 0 ||
+                    difftime(now, last_cc_inject_time) >= inject_interval_sec) {
                     pthread_mutex_lock(&g_state.mutex);
                     char cc_text[MAX_TEXT_LEN];
                     strncpy(cc_text, g_state.text, MAX_TEXT_LEN - 1);
@@ -2180,10 +2235,11 @@ int main(int argc, char *argv[])
                     pthread_mutex_unlock(&g_state.mutex);
 
                     if (cc_text[0] != '\0') {
-                        int extra = inject_cc608_into_video_ts(ts_packet, cc_text,
-                                                               &video_cc_tracker);
+                        int extra = inject_cc_into_video_ts(ts_packet, cc_text,
+                                                            &video_cc_tracker,
+                                                            (unsigned int)now);
                         packet_count += extra;
-                        last_cc608_inject_time = now;
+                        last_cc_inject_time = now;
                     }
                 }
             }

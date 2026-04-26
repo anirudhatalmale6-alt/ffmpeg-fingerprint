@@ -17,12 +17,12 @@ make
 
 # 3. Run (fingerprint always visible, all devices)
 ffmpeg -i "SOURCE_URL" -c:v copy -c:a copy -f mpegts pipe:1 | \
-  ./bin/ts_fingerprint --text "USERNAME_123" --cc608 --forced | \
+  ./bin/ts_fingerprint --text "USERNAME_123" --cc --forced | \
   ffmpeg -i pipe:0 -c copy -f mpegts output.ts
 
 # 4. Run with ZMQ control (show/hide on demand)
 ffmpeg -i "SOURCE_URL" -c:v copy -c:a copy -f mpegts pipe:1 | \
-  ./bin/ts_fingerprint --cc608 --forced --zmq tcp://127.0.0.1:5556 | \
+  ./bin/ts_fingerprint --cc --forced --zmq tcp://127.0.0.1:5556 | \
   ffmpeg -i pipe:0 -c copy -f mpegts output.ts
 
 # 5. Trigger fingerprint via Python
@@ -87,9 +87,10 @@ Fingerprint Options:
                    720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K
   --fontscale N    Font scale factor 1-4 (default: auto based on display)
   --forced         Mark subtitle as hearing-impaired (auto-selects on some players)
-  --cc608          Also inject CEA-608 closed captions into H.264 video stream
+  --cc             Inject CEA-608+708 closed captions into H.264 video stream
+                   CEA-708: random window positioning (anti-tamper)
+                   CEA-608: fixed bottom row (backwards compatibility)
                    Auto-displays on ExoPlayer IPTV apps (iboPlayer, TiviMate, etc.)
-                   Zero re-encoding - injects SEI NAL units into existing video
 
 Stream Statistics (built-in ffprobe replacement):
   --stats N        Print stream stats to stderr every N seconds (0=off)
@@ -267,65 +268,86 @@ Your IPTV panel can add this parameter when launching VLC.
 
 ---
 
-## CEA-608 Closed Captions (IPTV App Auto-Display)
+## CEA-608+708 Closed Captions (IPTV App Auto-Display + Anti-Tamper)
 
 For IPTV apps like iboPlayer, TiviMate, XCIPTV, and any ExoPlayer-based player,
-DVB subtitles may not auto-display. The `--cc608` flag solves this by injecting
-CEA-608 closed captions directly into the H.264 video stream as SEI NAL units.
+DVB subtitles may not auto-display. The `--cc` flag solves this by injecting
+both CEA-608 and CEA-708 closed captions into the H.264 video stream as SEI NAL units.
 
-ExoPlayer has built-in CEA-608 support and typically auto-displays closed captions
-without any user configuration needed.
+### CEA-708 vs CEA-608
+
+Both standards are injected simultaneously in the same SEI NAL unit:
+
+| Feature | CEA-608 | CEA-708 |
+|---------|---------|---------|
+| Positioning | Fixed bottom row only | Random window position (anti-tamper) |
+| Device support | Older decoders, basic ExoPlayer | Modern ExoPlayer, Android TV, smart TVs |
+| Text limit | Up to 32 chars (truncated if needed) | Up to 32 chars (full text) |
+| Purpose | Backwards compatibility fallback | Primary display with tamper resistance |
+
+CEA-708 uses DefineWindow with random relative anchor positioning (5-75% vertical,
+5-60% horizontal). The position changes on each injection cycle, making it harder
+for users to cover/crop the fingerprint.
 
 ### How It Works
 
-CEA-608 captions are embedded INSIDE the H.264 video bitstream (not a separate PID).
-The injection uses ATSC A/53 GA94 format SEI NALUs inserted at keyframes.
-No video re-encoding required - zero CPU overhead.
+Both CEA-608 and CEA-708 are embedded INSIDE the H.264 video bitstream (not a
+separate PID). The injection uses ATSC A/53 GA94 format SEI NALUs inserted at
+keyframes. No video re-encoding required - zero CPU overhead.
+
+CEA-708 DTVCC packet structure:
+- DeleteWindows: clears previous position
+- DefineWindow: creates window at new random position (translucent background)
+- Text characters: fingerprint text in the window
 
 ### Usage
 
 ```bash
-# CEA-608 + DVB subtitle (recommended - covers all devices)
+# CEA-608+708 + DVB subtitle (recommended - covers all devices)
 ffmpeg -i "SOURCE" -c:v copy -c:a copy -f mpegts pipe:1 | \
-  ./bin/ts_fingerprint --cc608 --forced --zmq tcp://127.0.0.1:5556 | \
+  ./bin/ts_fingerprint --cc --forced --zmq tcp://127.0.0.1:5556 | \
   ffmpeg -i pipe:0 -c copy -f mpegts output.ts
 
 # Or with the wrapper script:
-./ffmpeg_fingerprint.sh -i "SOURCE" --text "USERNAME" --cc608 --forced -f mpegts output.ts
+./ffmpeg_fingerprint.sh -i "SOURCE" --text "USERNAME" --cc --forced -f mpegts output.ts
 
 # ZMQ triggered (show/hide on demand):
-./ffmpeg_fingerprint.sh -i "SOURCE" --cc608 --forced --zmq tcp://127.0.0.1:5556 -f mpegts output.ts
+./ffmpeg_fingerprint.sh -i "SOURCE" --cc --forced --zmq tcp://127.0.0.1:5556 -f mpegts output.ts
 # Then: python3 python/db_trigger.py "USERNAME" 300 tcp://127.0.0.1:5556
 ```
 
 ### Device Coverage
 
-When using `--cc608 --forced`, ALL devices receive the fingerprint:
+When using `--cc --forced`, ALL devices receive the fingerprint:
 
-| Device / Player | Fingerprint Method | Auto-Display |
-|----------------|-------------------|-------------|
-| MAG / Infomir STBs | DVB subtitle | Yes (native format) |
-| Enigma2 (Zgemma, Dreambox) | DVB subtitle | Yes (native format) |
-| iboPlayer | CEA-608 caption | Yes (ExoPlayer built-in) |
-| TiviMate | CEA-608 caption | Yes (ExoPlayer built-in) |
-| XCIPTV | CEA-608 caption | Yes (ExoPlayer built-in) |
-| GSE Smart IPTV | CEA-608 caption | Yes (ExoPlayer built-in) |
-| VLC (with sub-track=0) | DVB subtitle | Yes (m3u option) |
-| VLC (unconfigured) | DVB subtitle | Manual selection |
-| Kodi | DVB subtitle | Yes (with subtitle enabled) |
+| Device / Player | Fingerprint Method | Positioning | Auto-Display |
+|----------------|-------------------|------------|-------------|
+| MAG / Infomir STBs | DVB subtitle | Configurable (9 positions) | Yes |
+| Enigma2 (Zgemma, Dreambox) | DVB subtitle | Configurable (9 positions) | Yes |
+| iboPlayer | CEA-708 / CEA-608 | Random (708) or bottom (608) | Yes |
+| TiviMate | CEA-708 / CEA-608 | Random (708) or bottom (608) | Yes |
+| XCIPTV | CEA-708 / CEA-608 | Random (708) or bottom (608) | Yes |
+| GSE Smart IPTV | CEA-708 / CEA-608 | Random (708) or bottom (608) | Yes |
+| VLC (with sub-track=0) | DVB subtitle | Configurable (9 positions) | Yes |
+| VLC (unconfigured) | DVB subtitle | Configurable (9 positions) | Manual |
+| Kodi | DVB subtitle | Configurable (9 positions) | Yes |
+
+ExoPlayer-based apps (iboPlayer, TiviMate, etc.) prefer CEA-708 when available.
+If the decoder only supports CEA-608, the fixed bottom-row fallback is used.
 
 ### How It Combines with DVB Subtitles
 
-One pipeline injects BOTH simultaneously:
-- DVB subtitle: separate PID in the MPEG-TS stream
-- CEA-608 caption: embedded in the H.264 video NAL units
+One pipeline injects ALL simultaneously:
+- DVB subtitle: separate PID in the MPEG-TS stream (for STBs and desktop players)
+- CEA-708 caption: positioned window in the H.264 SEI (for modern IPTV apps)
+- CEA-608 caption: bottom-row text in the same SEI (for older decoders)
 
-Each device picks up whichever format it supports. No conflict between the two.
+Each device picks up whichever format it supports. No conflict between the three.
 
 ### Caption Appearance
 
-CEA-608 captions appear as white text at the bottom of the screen (standard closed
-caption positioning, row 15). The text uses roll-up 2-line mode.
+CEA-708: white text on translucent black background, random position on each cycle.
+CEA-608: white text at bottom of screen (row 15), roll-up 2-line mode.
 
 ---
 
@@ -380,18 +402,19 @@ video with the fingerprint text drawn directly into the video frames.
                    Auto-uses bundled fonts/dash.ttf when no --font specified
 ```
 
-### Comparison: DVB Subtitle vs CEA-608 vs Burn-In
+### Comparison: DVB Subtitle vs CEA-608+708 vs Burn-In
 
-| Feature | DVB Subtitle | DVB + CEA-608 | Burn-In | Dual |
-|---------|-------------|--------------|---------|------|
+| Feature | DVB Subtitle | DVB + CEA-608+708 | Burn-In | Dual |
+|---------|-------------|-------------------|---------|------|
 | CPU usage | Zero | Zero | High (re-encoding) | High |
 | MAG/Enigma2 | Auto-display | Auto-display | Always visible | Always visible |
-| iboPlayer/TiviMate | Not visible | Auto-display (CEA-608) | Always visible | Always visible |
+| iboPlayer/TiviMate | Not visible | Auto-display (708/608) | Always visible | Always visible |
 | VLC (configured) | Auto-display | Auto-display | Always visible | Always visible |
 | VLC (unconfigured) | Not visible | Not visible | Always visible | Always visible |
 | Raw .ts playback | Not visible | Not visible | Always visible | Always visible |
 | Web players | Not visible | Not visible | Always visible | Always visible |
-| Text position | Random (anti-tamper) | DVB=random, CC=bottom | Random (moves) | Both |
+| Text position | Random (9 pos) | DVB=9 pos, 708=random% | Random (moves) | Both |
+| Anti-tamper | 9 fixed positions | 708=random anywhere | Random (moves) | Both |
 | ZMQ control | Full (SHOW/HIDE) | Full (SHOW/HIDE) | No (always on) | DVB part only |
 | Recommended for | MAG/Enigma2 | All IPTV setups | Raw .ts / web | Maximum security |
 
@@ -766,7 +789,7 @@ make clean
 ### Fingerprint not visible
 1. Check subtitles are enabled in player
 2. Try `--forced --lang eng` flags
-3. For IPTV apps (iboPlayer, TiviMate): add `--cc608` flag
+3. For IPTV apps (iboPlayer, TiviMate): add `--cc` flag
 4. For VLC: add `-disposition:s:0 default` to output FFmpeg
 5. For MAG: set portal subtitle language to match --lang
 6. Run `./bin/ts_fingerprint --stats 5` to verify stream is flowing
