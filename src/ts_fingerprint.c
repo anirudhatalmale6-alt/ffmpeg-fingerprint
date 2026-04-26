@@ -1567,99 +1567,150 @@ static void parse_pmt(const uint8_t *ts_packet)
 }
 
 /*
- * Build a modified PMT that includes our subtitle PID.
- * Returns a single TS packet.
- * Increments the PMT version_number to signal the change to decoders.
+ * Build a modified PMT that includes our subtitle PID and (when --cc is
+ * enabled) adds ATSC registration + caption_service descriptors to the
+ * video PID so ExoPlayer-based IPTV apps initialise their CC decoder.
+ *
+ * Reconstructs the section from scratch for safe byte insertion.
  */
 static int build_modified_pmt(uint8_t *out_ts)
 {
     if (!pmt_found) return -1;
 
-    /* Start with original PMT */
+    /* Copy original TS header */
     memcpy(out_ts, original_pmt, TS_PACKET_SIZE);
 
-    /* Find the payload offset */
-    int has_adaptation = (out_ts[3] >> 5) & 0x01;
-    int offset = 4;
-    if (has_adaptation) offset = 5 + out_ts[4];
-    offset += out_ts[offset] + 1; /* pointer field */
+    /* Locate PMT section start */
+    int has_adapt = (original_pmt[3] >> 5) & 0x01;
+    int ts_off = 4;
+    if (has_adapt) ts_off = 5 + original_pmt[4];
+    int ptr_field = original_pmt[ts_off];
+    int pmt_start = ts_off + ptr_field + 1;
 
-    /* Bounds check */
-    if (offset + 3 >= TS_PACKET_SIZE) return -1;
+    if (pmt_start + 12 >= TS_PACKET_SIZE) return -1;
 
-    /* Increment version_number in the PMT header.
-     * Byte at offset+5: reserved(2) | version_number(5) | current_next_indicator(1)
-     */
-    uint8_t new_version = (original_pmt_version + 1) & 0x1F;
-    out_ts[offset + 5] = (out_ts[offset + 5] & 0xC1) | (new_version << 1);
+    const uint8_t *orig = original_pmt + pmt_start;
 
-    /* Find section_length */
-    int section_length = ((out_ts[offset + 1] & 0x0F) << 8) | out_ts[offset + 2];
-    int section_end = offset + 3 + section_length - 4; /* before CRC */
+    /* Parse original PMT header */
+    uint8_t table_id        = orig[0];
+    int orig_sec_len        = ((orig[1] & 0x0F) << 8) | orig[2];
+    uint16_t prog_num       = (orig[3] << 8) | orig[4];
+    uint8_t ver_byte        = orig[5];
+    uint8_t sec_num         = orig[6];
+    uint8_t last_sec_num    = orig[7];
+    uint16_t pcr_pid        = ((orig[8] & 0x1F) << 8) | orig[9];
+    int prog_info_len       = ((orig[10] & 0x0F) << 8) | orig[11];
 
-    /*
-     * DVB subtitle stream entry we need to add:
-     *   stream_type:     1 byte  (0x06)
-     *   elementary_PID:  2 bytes (with reserved bits)
-     *   ES_info_length:  2 bytes (with reserved bits)
-     *   descriptor 0x59: 2 + 8 = 10 bytes
-     *     tag(1) + length(1) + lang(3) + type(1) + comp_page(2) + anc_page(2)
-     * Total: 5 + 10 = 15 bytes
-     * Plus 4 bytes for CRC after.
-     */
-    int entry_size = 15;
+    /* Build new section in temp buffer */
+    uint8_t sec[512];
+    int sp = 0;
 
-    /* Check if we have room in the TS packet */
-    if (section_end + entry_size + 4 > TS_PACKET_SIZE) {
-        /* Not enough room - skip PMT modification */
-        return -1;
+    /* Header (12 bytes) */
+    sec[sp++] = table_id;
+    sp += 2; /* section_length placeholder */
+    sec[sp++] = (prog_num >> 8) & 0xFF;
+    sec[sp++] = prog_num & 0xFF;
+    sec[sp++] = (ver_byte & 0xC1) | (((original_pmt_version + 1) & 0x1F) << 1);
+    sec[sp++] = sec_num;
+    sec[sp++] = last_sec_num;
+    sec[sp++] = 0xE0 | ((pcr_pid >> 8) & 0x1F);
+    sec[sp++] = pcr_pid & 0xFF;
+    sec[sp++] = 0xF0 | ((prog_info_len >> 8) & 0x0F);
+    sec[sp++] = prog_info_len & 0xFF;
+
+    /* Copy program-level descriptors */
+    if (12 + prog_info_len > orig_sec_len + 3) return -1;
+    memcpy(sec + sp, orig + 12, prog_info_len);
+    sp += prog_info_len;
+
+    /* Walk original stream entries, copying and modifying */
+    int orig_pos = 12 + prog_info_len;
+    int orig_end = 3 + orig_sec_len - 4; /* before CRC */
+
+    while (orig_pos + 5 <= orig_end) {
+        uint8_t stype = orig[orig_pos];
+        uint16_t epid = ((orig[orig_pos + 1] & 0x1F) << 8) | orig[orig_pos + 2];
+        int es_len    = ((orig[orig_pos + 3] & 0x0F) << 8) | orig[orig_pos + 4];
+
+        if (cc_enabled && epid == video_pid) {
+            /* Copy stream entry with added CC descriptors */
+            int extra = 6 + 15; /* registration_descriptor(6) + caption_service(15) */
+            int new_es_len = es_len + extra;
+
+            sec[sp++] = stype;
+            sec[sp++] = 0xE0 | ((epid >> 8) & 0x1F);
+            sec[sp++] = epid & 0xFF;
+            sec[sp++] = 0xF0 | ((new_es_len >> 8) & 0x0F);
+            sec[sp++] = new_es_len & 0xFF;
+
+            /* Original ES descriptors */
+            if (es_len > 0) {
+                memcpy(sec + sp, orig + orig_pos + 5, es_len);
+                sp += es_len;
+            }
+
+            /* registration_descriptor: format_identifier = "GA94" */
+            sec[sp++] = 0x05; sec[sp++] = 0x04;
+            sec[sp++] = 'G'; sec[sp++] = 'A'; sec[sp++] = '9'; sec[sp++] = '4';
+
+            /* caption_service_descriptor (ATSC A/65, tag 0x86)
+             * 2 services: CEA-708 service 1 + CEA-608 field 1 */
+            sec[sp++] = 0x86; sec[sp++] = 13; /* descriptor_length */
+            sec[sp++] = 0xE0 | 2;             /* reserved(3)=111, number_of_services=2 */
+            /* Service 1: CEA-708, caption_service_number=1 */
+            sec[sp++] = subtitle_lang[0]; sec[sp++] = subtitle_lang[1]; sec[sp++] = subtitle_lang[2];
+            sec[sp++] = 0xC1; /* digital_cc=1, reserved=1, service_number=000001 */
+            sec[sp++] = 0x3F; /* easy_reader=0, wide_aspect=0, reserved=111111 */
+            sec[sp++] = 0xFF; /* reserved */
+            /* Service 2: CEA-608, field 1 */
+            sec[sp++] = subtitle_lang[0]; sec[sp++] = subtitle_lang[1]; sec[sp++] = subtitle_lang[2];
+            sec[sp++] = 0x7F; /* digital_cc=0, reserved=1, reserved=11111, line21_field=1 */
+            sec[sp++] = 0x3F;
+            sec[sp++] = 0xFF;
+        } else {
+            /* Copy stream entry verbatim */
+            int entry_size = 5 + es_len;
+            memcpy(sec + sp, orig + orig_pos, entry_size);
+            sp += entry_size;
+        }
+
+        orig_pos += 5 + es_len;
     }
 
-    int p = section_end;
+    /* Append DVB subtitle stream entry */
+    sec[sp++] = STREAM_TYPE_DVB_SUB;
+    sec[sp++] = 0xE0 | ((SUBTITLE_PID >> 8) & 0x1F);
+    sec[sp++] = SUBTITLE_PID & 0xFF;
+    int sub_es_len = 10;
+    sec[sp++] = 0xF0 | ((sub_es_len >> 8) & 0x0F);
+    sec[sp++] = sub_es_len & 0xFF;
+    sec[sp++] = 0x59; sec[sp++] = 8;
+    sec[sp++] = subtitle_lang[0]; sec[sp++] = subtitle_lang[1]; sec[sp++] = subtitle_lang[2];
+    sec[sp++] = subtitling_type;
+    sec[sp++] = 0x00; sec[sp++] = 0x01; /* composition_page_id */
+    sec[sp++] = 0x00; sec[sp++] = 0x01; /* ancillary_page_id */
 
-    /* stream_type = 0x06 (private data / DVB subtitle) */
-    out_ts[p++] = STREAM_TYPE_DVB_SUB;
+    /* Fill section_length: total bytes after field = (sp - 3) + CRC(4) */
+    int new_sec_len = sp - 3 + 4;
+    sec[1] = 0xB0 | ((new_sec_len >> 8) & 0x0F);
+    sec[2] = new_sec_len & 0xFF;
 
-    /* elementary_PID with reserved bits (3 bits reserved = 111) */
-    out_ts[p++] = 0xE0 | ((SUBTITLE_PID >> 8) & 0x1F);
-    out_ts[p++] = SUBTITLE_PID & 0xFF;
+    /* CRC32 over entire section (from table_id through last byte before CRC) */
+    uint32_t crc = calc_crc32(sec, sp);
+    sec[sp++] = (crc >> 24) & 0xFF;
+    sec[sp++] = (crc >> 16) & 0xFF;
+    sec[sp++] = (crc >>  8) & 0xFF;
+    sec[sp++] = crc & 0xFF;
 
-    /* ES_info_length = 10 (descriptor tag + len + 8 bytes payload) */
-    int es_info_len = 10;
-    out_ts[p++] = 0xF0 | ((es_info_len >> 8) & 0x0F);
-    out_ts[p++] = es_info_len & 0xFF;
+    /* Verify it fits */
+    if (pmt_start + sp > TS_PACKET_SIZE) return -1;
 
-    /* DVB Subtitle descriptor (tag=0x59) */
-    out_ts[p++] = 0x59;  /* descriptor_tag */
-    out_ts[p++] = 8;     /* descriptor_length (8 bytes of payload) */
-    out_ts[p++] = subtitle_lang[0]; /* ISO 639 language code (configurable via --lang) */
-    out_ts[p++] = subtitle_lang[1];
-    out_ts[p++] = subtitle_lang[2];
-    out_ts[p++] = subtitling_type; /* subtitling_type: 0x10=normal, 0x20=hearing_impaired */
-    out_ts[p++] = 0x00;  /* composition_page_id high */
-    out_ts[p++] = 0x01;  /* composition_page_id low */
-    out_ts[p++] = 0x00;  /* ancillary_page_id high */
-    out_ts[p++] = 0x01;  /* ancillary_page_id low */
-
-    /* Update section_length */
-    int new_section_length = section_length + entry_size;
-    out_ts[offset + 1] = 0xB0 | ((new_section_length >> 8) & 0x0F);
-    out_ts[offset + 2] = new_section_length & 0xFF;
-
-    /* Recalculate CRC32 */
-    int crc_pos = p;
-    int crc_data_len = crc_pos - offset;
-    uint32_t crc = calc_crc32(out_ts + offset, crc_data_len);
-    out_ts[crc_pos++] = (crc >> 24) & 0xFF;
-    out_ts[crc_pos++] = (crc >> 16) & 0xFF;
-    out_ts[crc_pos++] = (crc >> 8) & 0xFF;
-    out_ts[crc_pos++] = crc & 0xFF;
-
-    /* Fill remainder with 0xFF (stuffing) */
-    for (int i = crc_pos; i < TS_PACKET_SIZE; i++)
+    /* Write section into TS packet and stuff remainder */
+    memcpy(out_ts + pmt_start, sec, sp);
+    for (int i = pmt_start + sp; i < TS_PACKET_SIZE; i++)
         out_ts[i] = 0xFF;
 
-    /* Update continuity counter */
+    /* Continuity counter */
     out_ts[3] = (out_ts[3] & 0xF0) | (pmt_cc & 0x0F);
     pmt_cc = (pmt_cc + 1) & 0x0F;
 
