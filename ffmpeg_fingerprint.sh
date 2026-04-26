@@ -65,6 +65,7 @@ FP_FORCED=0
 FP_FONT=""
 FP_STATS=""
 FP_DEFAULT_SUB=0
+FP_CC608=0
 FP_BURN_IN=0
 FP_DUAL=0
 FP_BURN_PRESET="ultrafast"
@@ -112,6 +113,9 @@ Fingerprint Options:
   --fontscale N    Font scale 1-4 (default: auto based on display)
   --font FILE      Use custom TTF font instead of built-in bitmap font
   --forced         Mark as hearing-impaired (auto-selects on some players)
+  --cc608          Also inject CEA-608 closed captions into H.264 video stream
+                   Auto-displays on ExoPlayer IPTV apps (iboPlayer, TiviMate, etc.)
+                   Zero re-encoding - injects into existing video bitstream
   --default-sub    Add FFmpeg -disposition:s:0 default to output for VLC auto-display
   --burn-in        Burn text into video frames (uses CPU, works on ALL players)
                    Uses libx264 ultrafast. Guaranteed visible, no subtitle selection needed
@@ -218,6 +222,10 @@ while [ $# -gt 0 ]; do
             ;;
         --default-sub)
             FP_DEFAULT_SUB=1
+            shift
+            ;;
+        --cc608)
+            FP_CC608=1
             shift
             ;;
         --burn-in)
@@ -337,6 +345,10 @@ if [ "$FP_FORCED" -eq 1 ]; then
     TS_FP_ARGS+=(--forced)
 fi
 
+if [ "$FP_CC608" -eq 1 ]; then
+    TS_FP_ARGS+=(--cc608)
+fi
+
 if [ -n "$FP_STATS" ]; then
     TS_FP_ARGS+=(--stats "$FP_STATS")
 fi
@@ -382,6 +394,9 @@ if [ -n "$FP_DISPLAY" ]; then
 fi
 if [ "$FP_FORCED" -eq 1 ]; then
     echo "[ffmpeg_fingerprint]   Forced subtitle: yes" >&2
+fi
+if [ "$FP_CC608" -eq 1 ]; then
+    echo "[ffmpeg_fingerprint]   CEA-608 captions: yes (IPTV app auto-display)" >&2
 fi
 if [ "$FP_DUAL" -eq 1 ]; then
     echo "[ffmpeg_fingerprint]   Mode: DUAL (burn-in + DVB subtitle, maximum protection)" >&2

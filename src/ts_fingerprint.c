@@ -972,6 +972,291 @@ static int build_dvb_subtitle_clear(int page_id, uint8_t **out_buf, int *out_siz
 }
 
 /* ------------------------------------------------------------------ */
+/*  CEA-608 Closed Caption Injection (for ExoPlayer/IPTV apps)        */
+/* ------------------------------------------------------------------ */
+
+static int cc608_enabled = 0;
+
+static uint8_t cc608_parity(uint8_t c)
+{
+    int ones = 0;
+    uint8_t v = c & 0x7F;
+    while (v) { ones += v & 1; v >>= 1; }
+    return (ones & 1) ? (c & 0x7F) : (c | 0x80);
+}
+
+/*
+ * Build a CEA-608 SEI NAL unit for H.264 (annex-B format with start code).
+ * Encodes the fingerprint text as roll-up captions at the bottom of the screen.
+ *
+ * SEI payload structure (ATSC A/53 / A/72):
+ *   payload_type = 4 (user_data_registered_itu_t_t35)
+ *   country_code = 0xB5 (US)
+ *   provider_code = 0x0031 (ATSC)
+ *   user_identifier = "GA94"
+ *   user_data_type_code = 0x03 (cc_data)
+ *   cc_data triplets with CEA-608 field 1 data
+ */
+static int build_cc608_sei(const char *text, uint8_t **out_buf, int *out_size)
+{
+    int text_len = strlen(text);
+    if (text_len > 32) text_len = 32;
+
+    /*
+     * CEA-608 command sequence (roll-up 2 lines, row 15):
+     *   1. EDM (erase displayed memory): clear screen
+     *   2. RU2 (roll-up 2 rows mode)
+     *   3. PAC row 15, indent 0 (bottom left)
+     *   4. Text character pairs
+     *   5. Padding null pairs to fill cc_count
+     */
+    int char_pairs = (text_len + 1) / 2;
+    int cc_count = 3 + char_pairs;
+    if (cc_count > 31) cc_count = 31;
+
+    /* Build cc_data triplets */
+    int triplets_size = cc_count * 3;
+    uint8_t *triplets = malloc(triplets_size);
+    if (!triplets) return -1;
+
+    int t = 0;
+    /* Triplet 1: EDM (erase displayed memory) - 0x14, 0x2C */
+    triplets[t++] = 0xFC; /* cc_valid=1, cc_type=00 (field 1) */
+    triplets[t++] = cc608_parity(0x14);
+    triplets[t++] = cc608_parity(0x2C);
+
+    /* Triplet 2: RU2 (roll-up 2 rows) - 0x14, 0x25 */
+    triplets[t++] = 0xFC;
+    triplets[t++] = cc608_parity(0x14);
+    triplets[t++] = cc608_parity(0x25);
+
+    /* Triplet 3: PAC row 15, indent 0, white - 0x17, 0x60 */
+    triplets[t++] = 0xFC;
+    triplets[t++] = cc608_parity(0x17);
+    triplets[t++] = cc608_parity(0x60);
+
+    /* Text character pairs */
+    for (int i = 0; i < text_len && t < triplets_size; i += 2) {
+        triplets[t++] = 0xFC;
+        triplets[t++] = cc608_parity((uint8_t)text[i]);
+        if (i + 1 < text_len)
+            triplets[t++] = cc608_parity((uint8_t)text[i + 1]);
+        else
+            triplets[t++] = cc608_parity(0x20); /* pad with space */
+    }
+
+    /*
+     * Build SEI RBSP:
+     *   payload_type(1) + payload_size(1) + country_code(1) + provider_code(2)
+     *   + user_id(4) + type_code(1) + cc_header(1) + em_data(1) + triplets + marker(1)
+     *   + RBSP trailing(1)
+     */
+    int payload_data_size = 1 + 2 + 4 + 1 + 1 + 1 + t + 1;
+    int sei_rbsp_size = 1 + 1 + payload_data_size + 1;
+    uint8_t *sei_rbsp = malloc(sei_rbsp_size + 16);
+    if (!sei_rbsp) { free(triplets); return -1; }
+
+    int p = 0;
+    sei_rbsp[p++] = 4; /* payload_type = user_data_registered_itu_t_t35 */
+    sei_rbsp[p++] = (uint8_t)payload_data_size;
+    sei_rbsp[p++] = 0xB5; /* country_code = United States */
+    sei_rbsp[p++] = 0x00; /* provider_code high = ATSC */
+    sei_rbsp[p++] = 0x31; /* provider_code low */
+    sei_rbsp[p++] = 0x47; /* 'G' */
+    sei_rbsp[p++] = 0x41; /* 'A' */
+    sei_rbsp[p++] = 0x39; /* '9' */
+    sei_rbsp[p++] = 0x34; /* '4' */
+    sei_rbsp[p++] = 0x03; /* user_data_type_code = cc_data */
+    sei_rbsp[p++] = 0xC0 | (cc_count & 0x1F); /* process_cc_data=1, zero=1, cc_count */
+    sei_rbsp[p++] = 0xFF; /* em_data */
+    memcpy(sei_rbsp + p, triplets, t); p += t;
+    sei_rbsp[p++] = 0xFF; /* marker_bits */
+    sei_rbsp[p++] = 0x80; /* RBSP trailing bits */
+
+    int rbsp_size = p;
+    free(triplets);
+
+    /* Build complete NAL unit with start code + emulation prevention */
+    int max_nal_size = 4 + 1 + rbsp_size * 3 / 2 + 4;
+    uint8_t *nal = malloc(max_nal_size);
+    if (!nal) { free(sei_rbsp); return -1; }
+
+    int np = 0;
+    nal[np++] = 0x00;
+    nal[np++] = 0x00;
+    nal[np++] = 0x00;
+    nal[np++] = 0x01;
+    nal[np++] = 0x06; /* NAL type = SEI */
+
+    int zero_count = 0;
+    for (int i = 0; i < rbsp_size; i++) {
+        if (zero_count >= 2 && sei_rbsp[i] <= 0x03) {
+            nal[np++] = 0x03; /* emulation prevention byte */
+            zero_count = 0;
+        }
+        nal[np++] = sei_rbsp[i];
+        if (sei_rbsp[i] == 0x00) zero_count++;
+        else zero_count = 0;
+    }
+
+    free(sei_rbsp);
+    *out_buf = nal;
+    *out_size = np;
+    return 0;
+}
+
+/*
+ * Inject CEA-608 SEI NAL into a video PES start TS packet.
+ * Modifies the packet in-place and returns any overflow TS packets.
+ *
+ * Strategy: insert the SEI NAL data after the PES header, before the video NALs.
+ * If the data doesn't fit in one TS packet, emit extra continuation packets.
+ *
+ * Returns: number of extra TS packets written to stdout (0 or more)
+ */
+static int inject_cc608_into_video_ts(uint8_t *ts_packet, const char *text,
+                                       uint8_t *video_cc_ptr)
+{
+    uint8_t *sei_nal = NULL;
+    int sei_size = 0;
+
+    if (build_cc608_sei(text, &sei_nal, &sei_size) != 0)
+        return 0;
+
+    /* Parse TS header */
+    int afc = (ts_packet[3] >> 4) & 0x03;
+    int payload_offset = 4;
+
+    if (afc == 2 || afc == 3) {
+        payload_offset = 5 + ts_packet[4]; /* skip adaptation field */
+    }
+
+    if (payload_offset >= TS_PACKET_SIZE - 9) {
+        free(sei_nal);
+        return 0;
+    }
+
+    /* Find start of PES payload (after PES header) */
+    int pes_hdr_start = payload_offset;
+    /* PES header: 00 00 01 <stream_id> <length(2)> <flags(2)> <hdr_data_len(1)> */
+    if (ts_packet[pes_hdr_start] != 0x00 || ts_packet[pes_hdr_start + 1] != 0x00 ||
+        ts_packet[pes_hdr_start + 2] != 0x01) {
+        free(sei_nal);
+        return 0;
+    }
+
+    int pes_hdr_data_len = ts_packet[pes_hdr_start + 8];
+    int nal_data_start = pes_hdr_start + 9 + pes_hdr_data_len;
+
+    if (nal_data_start >= TS_PACKET_SIZE) {
+        free(sei_nal);
+        return 0;
+    }
+
+    /* Find the first H.264 NAL start code after PES header */
+    int insert_point = -1;
+    for (int i = nal_data_start; i < TS_PACKET_SIZE - 4; i++) {
+        if (ts_packet[i] == 0x00 && ts_packet[i + 1] == 0x00) {
+            int sc3 = (ts_packet[i + 2] == 0x01);
+            int sc4 = (i + 3 < TS_PACKET_SIZE && ts_packet[i + 2] == 0x00 &&
+                       ts_packet[i + 3] == 0x01);
+            if (sc3 || sc4) {
+                int nal_hdr = sc4 ? i + 4 : i + 3;
+                if (nal_hdr < TS_PACKET_SIZE) {
+                    int nal_type = ts_packet[nal_hdr] & 0x1F;
+                    /* Insert before IDR (5) or non-IDR slice (1) */
+                    if (nal_type == 5 || nal_type == 1) {
+                        insert_point = i;
+                        break;
+                    }
+                    /* Skip over AUD (9), SPS (7), PPS (8), existing SEI (6) */
+                }
+            }
+        }
+    }
+
+    if (insert_point < 0) {
+        /* No slice NAL found in first packet - insert right after PES header */
+        insert_point = nal_data_start;
+    }
+
+    /* Calculate the original payload after the insert point */
+    int orig_tail_len = TS_PACKET_SIZE - insert_point;
+    int total_new_data = sei_size + orig_tail_len;
+
+    /* Space available from insert_point to end of packet */
+    int space_in_first = TS_PACKET_SIZE - insert_point;
+
+    if (sei_size <= 0) {
+        free(sei_nal);
+        return 0;
+    }
+
+    /* Build combined buffer: SEI NAL + original trailing data */
+    uint8_t *combined = malloc(total_new_data);
+    if (!combined) { free(sei_nal); return 0; }
+
+    memcpy(combined, sei_nal, sei_size);
+    memcpy(combined + sei_size, ts_packet + insert_point, orig_tail_len);
+    free(sei_nal);
+
+    /* Write back what fits into the first TS packet */
+    int first_chunk = (total_new_data < space_in_first) ? total_new_data : space_in_first;
+    memcpy(ts_packet + insert_point, combined, first_chunk);
+
+    /* If all data fit, pad remainder with 0xFF if needed (shouldn't happen - same size) */
+    if (total_new_data <= space_in_first) {
+        /* Data actually got LARGER by sei_size, but we only have space_in_first bytes.
+         * This case means sei_size == 0 or insert_point is at the end. Skip. */
+        free(combined);
+        return 0;
+    }
+
+    /* Overflow: emit additional TS continuation packets */
+    int remaining = total_new_data - first_chunk;
+    int offset = first_chunk;
+    int extra_packets = 0;
+    uint16_t vid_pid = ((ts_packet[1] & 0x1F) << 8) | ts_packet[2];
+
+    while (remaining > 0) {
+        uint8_t extra_ts[TS_PACKET_SIZE];
+        memset(extra_ts, 0xFF, TS_PACKET_SIZE);
+
+        *video_cc_ptr = (*video_cc_ptr + 1) & 0x0F;
+
+        extra_ts[0] = TS_SYNC_BYTE;
+        extra_ts[1] = (vid_pid >> 8) & 0x1F; /* no PUSI, no errors */
+        extra_ts[2] = vid_pid & 0xFF;
+        extra_ts[3] = 0x10 | (*video_cc_ptr & 0x0F); /* payload only, CC */
+
+        int chunk = remaining;
+        if (chunk > TS_MAX_PAYLOAD) chunk = TS_MAX_PAYLOAD;
+
+        /* If less than full payload, add adaptation field for stuffing */
+        if (chunk < TS_MAX_PAYLOAD) {
+            int stuff_len = TS_MAX_PAYLOAD - chunk;
+            extra_ts[3] = 0x30 | (*video_cc_ptr & 0x0F); /* adaptation + payload */
+            extra_ts[4] = (uint8_t)(stuff_len - 1); /* adaptation_field_length */
+            if (stuff_len > 1) {
+                extra_ts[5] = 0x00; /* flags = 0 */
+                memset(extra_ts + 6, 0xFF, stuff_len - 2); /* stuffing */
+            }
+            memcpy(extra_ts + 4 + stuff_len, combined + offset, chunk);
+        } else {
+            memcpy(extra_ts + 4, combined + offset, chunk);
+        }
+
+        fwrite(extra_ts, 1, TS_PACKET_SIZE, stdout);
+        offset += chunk;
+        remaining -= chunk;
+        extra_packets++;
+    }
+
+    free(combined);
+    return extra_packets;
+}
+
+/* ------------------------------------------------------------------ */
 /*  MPEG-TS Packet Construction                                       */
 /* ------------------------------------------------------------------ */
 
@@ -1623,6 +1908,9 @@ static void print_usage(const char *progname)
         "  --forced         Mark subtitle as hearing-impaired (auto-selects on some players)\n"
         "  --inject-interval N  Subtitle re-injection interval in seconds (default: 8)\n"
         "                   Lower = faster display on channel join, Higher = less overhead\n"
+        "  --cc608          Also inject CEA-608 closed captions into H.264 video stream\n"
+        "                   Auto-displays on ExoPlayer apps (iboPlayer, TiviMate, etc.)\n"
+        "                   Zero re-encoding - injects SEI NAL units into existing video\n"
         "\n"
         "Stream Statistics (built-in ffprobe):\n"
         "  --stats N        Print stream stats to stderr every N seconds (0=off)\n"
@@ -1692,6 +1980,8 @@ int main(int argc, char *argv[])
             inject_interval_sec = atoi(argv[++i]);
             if (inject_interval_sec < 2) inject_interval_sec = 2;
             if (inject_interval_sec > 30) inject_interval_sec = 30;
+        } else if (strcmp(argv[i], "--cc608") == 0) {
+            cc608_enabled = 1;
         } else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) {
             stats_stderr_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -1751,8 +2041,13 @@ int main(int argc, char *argv[])
     int needs_immediate_inject = 0;   /* set when text changes or first SHOW */
     int prev_active_state = 0;        /* track state changes */
     char prev_text[MAX_TEXT_LEN] = "";
+    uint8_t video_cc_tracker = 0;     /* track video PID CC for CEA-608 extra packets */
+    time_t last_cc608_inject_time = 0;
     (void)pat_cc;
 
+    if (cc608_enabled) {
+        fprintf(stderr, "[ts_fingerprint] CEA-608 closed captions: ENABLED (ExoPlayer/IPTV apps)\n");
+    }
     fprintf(stderr, "[ts_fingerprint] Processing MPEG-TS stream...\n");
 
     while (1) {
@@ -1829,6 +2124,9 @@ int main(int argc, char *argv[])
             int payload_start = (ts_packet[1] & 0x40) != 0;
             int keyframe_detected = 0;
 
+            /* Track video continuity counter for CEA-608 extra packets */
+            video_cc_tracker = ts_packet[3] & 0x0F;
+
             /* Check for random access indicator (keyframe) */
             if (ts_has_random_access(ts_packet)) {
                 keyframe_detected = 1;
@@ -1869,9 +2167,29 @@ int main(int argc, char *argv[])
                     prev_active_state = cur_active;
                 }
             }
+
+            /* CEA-608 closed caption injection at keyframes */
+            if (cc608_enabled && keyframe_detected && payload_start && g_state.active) {
+                time_t now = time(NULL);
+                if (last_cc608_inject_time == 0 ||
+                    difftime(now, last_cc608_inject_time) >= inject_interval_sec) {
+                    pthread_mutex_lock(&g_state.mutex);
+                    char cc_text[MAX_TEXT_LEN];
+                    strncpy(cc_text, g_state.text, MAX_TEXT_LEN - 1);
+                    cc_text[MAX_TEXT_LEN - 1] = '\0';
+                    pthread_mutex_unlock(&g_state.mutex);
+
+                    if (cc_text[0] != '\0') {
+                        int extra = inject_cc608_into_video_ts(ts_packet, cc_text,
+                                                               &video_cc_tracker);
+                        packet_count += extra;
+                        last_cc608_inject_time = now;
+                    }
+                }
+            }
         }
 
-        /* Pass through the current packet */
+        /* Pass through the current packet (possibly modified by CC608 injection) */
         fwrite(ts_packet, 1, TS_PACKET_SIZE, stdout);
         packet_count++;
 
