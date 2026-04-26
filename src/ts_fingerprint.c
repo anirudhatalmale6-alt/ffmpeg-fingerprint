@@ -1160,13 +1160,17 @@ static int build_cc_sei(const char *text, unsigned int rand_seed,
 
 /*
  * Inject CEA-608/708 SEI NAL into a video PES start TS packet.
- * Inserts SEI before the first slice NAL. Emits extra continuation
- * TS packets for overflow data.
+ * Inserts SEI before the first slice NAL. Overflow data is returned
+ * in overflow_out (caller must write them AFTER the modified PUSI packet).
  *
- * Returns: number of extra TS packets written to stdout (0 or more)
+ * overflow_out: buffer for up to 8 overflow TS packets (8 * 188 bytes)
+ * Returns: number of overflow packets (0 or more)
  */
+#define MAX_CC_OVERFLOW 8
+
 static int inject_cc_into_video_ts(uint8_t *ts_packet, const char *text,
-                                    uint8_t *video_cc_ptr, unsigned int rand_seed)
+                                    uint8_t *video_cc_ptr, unsigned int rand_seed,
+                                    uint8_t *overflow_out)
 {
     uint8_t *sei_nal = NULL;
     int sei_size = 0;
@@ -1189,7 +1193,6 @@ static int inject_cc_into_video_ts(uint8_t *ts_packet, const char *text,
 
     /* Find start of PES payload (after PES header) */
     int pes_hdr_start = payload_offset;
-    /* PES header: 00 00 01 <stream_id> <length(2)> <flags(2)> <hdr_data_len(1)> */
     if (ts_packet[pes_hdr_start] != 0x00 || ts_packet[pes_hdr_start + 1] != 0x00 ||
         ts_packet[pes_hdr_start + 2] != 0x01) {
         free(sei_nal);
@@ -1215,35 +1218,24 @@ static int inject_cc_into_video_ts(uint8_t *ts_packet, const char *text,
                 int nal_hdr = sc4 ? i + 4 : i + 3;
                 if (nal_hdr < TS_PACKET_SIZE) {
                     int nal_type = ts_packet[nal_hdr] & 0x1F;
-                    /* Insert before IDR (5) or non-IDR slice (1) */
                     if (nal_type == 5 || nal_type == 1) {
                         insert_point = i;
                         break;
                     }
-                    /* Skip over AUD (9), SPS (7), PPS (8), existing SEI (6) */
                 }
             }
         }
     }
 
-    if (insert_point < 0) {
-        /* No slice NAL found in first packet - insert right after PES header */
+    if (insert_point < 0)
         insert_point = nal_data_start;
-    }
 
-    /* Calculate the original payload after the insert point */
     int orig_tail_len = TS_PACKET_SIZE - insert_point;
     int total_new_data = sei_size + orig_tail_len;
-
-    /* Space available from insert_point to end of packet */
     int space_in_first = TS_PACKET_SIZE - insert_point;
 
-    if (sei_size <= 0) {
-        free(sei_nal);
-        return 0;
-    }
+    if (sei_size <= 0) { free(sei_nal); return 0; }
 
-    /* Build combined buffer: SEI NAL + original trailing data */
     uint8_t *combined = malloc(total_new_data);
     if (!combined) { free(sei_nal); return 0; }
 
@@ -1251,53 +1243,47 @@ static int inject_cc_into_video_ts(uint8_t *ts_packet, const char *text,
     memcpy(combined + sei_size, ts_packet + insert_point, orig_tail_len);
     free(sei_nal);
 
-    /* Write back what fits into the first TS packet */
     int first_chunk = (total_new_data < space_in_first) ? total_new_data : space_in_first;
     memcpy(ts_packet + insert_point, combined, first_chunk);
 
-    /* If all data fit, pad remainder with 0xFF if needed (shouldn't happen - same size) */
     if (total_new_data <= space_in_first) {
-        /* Data actually got LARGER by sei_size, but we only have space_in_first bytes.
-         * This case means sei_size == 0 or insert_point is at the end. Skip. */
         free(combined);
         return 0;
     }
 
-    /* Overflow: emit additional TS continuation packets */
+    /* Buffer overflow TS packets (caller writes them AFTER the PUSI packet) */
     int remaining = total_new_data - first_chunk;
     int offset = first_chunk;
     int extra_packets = 0;
     uint16_t vid_pid = ((ts_packet[1] & 0x1F) << 8) | ts_packet[2];
 
-    while (remaining > 0) {
-        uint8_t extra_ts[TS_PACKET_SIZE];
-        memset(extra_ts, 0xFF, TS_PACKET_SIZE);
+    while (remaining > 0 && extra_packets < MAX_CC_OVERFLOW) {
+        uint8_t *pkt = overflow_out + extra_packets * TS_PACKET_SIZE;
+        memset(pkt, 0xFF, TS_PACKET_SIZE);
 
         *video_cc_ptr = (*video_cc_ptr + 1) & 0x0F;
 
-        extra_ts[0] = TS_SYNC_BYTE;
-        extra_ts[1] = (vid_pid >> 8) & 0x1F; /* no PUSI, no errors */
-        extra_ts[2] = vid_pid & 0xFF;
-        extra_ts[3] = 0x10 | (*video_cc_ptr & 0x0F); /* payload only, CC */
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = (vid_pid >> 8) & 0x1F;
+        pkt[2] = vid_pid & 0xFF;
+        pkt[3] = 0x10 | (*video_cc_ptr & 0x0F);
 
         int chunk = remaining;
         if (chunk > TS_MAX_PAYLOAD) chunk = TS_MAX_PAYLOAD;
 
-        /* If less than full payload, add adaptation field for stuffing */
         if (chunk < TS_MAX_PAYLOAD) {
             int stuff_len = TS_MAX_PAYLOAD - chunk;
-            extra_ts[3] = 0x30 | (*video_cc_ptr & 0x0F); /* adaptation + payload */
-            extra_ts[4] = (uint8_t)(stuff_len - 1); /* adaptation_field_length */
+            pkt[3] = 0x30 | (*video_cc_ptr & 0x0F);
+            pkt[4] = (uint8_t)(stuff_len - 1);
             if (stuff_len > 1) {
-                extra_ts[5] = 0x00; /* flags = 0 */
-                memset(extra_ts + 6, 0xFF, stuff_len - 2); /* stuffing */
+                pkt[5] = 0x00;
+                memset(pkt + 6, 0xFF, stuff_len - 2);
             }
-            memcpy(extra_ts + 4 + stuff_len, combined + offset, chunk);
+            memcpy(pkt + 4 + stuff_len, combined + offset, chunk);
         } else {
-            memcpy(extra_ts + 4, combined + offset, chunk);
+            memcpy(pkt + 4, combined + offset, chunk);
         }
 
-        fwrite(extra_ts, 1, TS_PACKET_SIZE, stdout);
         offset += chunk;
         remaining -= chunk;
         extra_packets++;
@@ -2146,6 +2132,7 @@ int main(int argc, char *argv[])
     int prev_active_state = 0;        /* track state changes */
     char prev_text[MAX_TEXT_LEN] = "";
     uint8_t video_cc_tracker = 0;     /* track video PID CC for CC injection extra packets */
+    int video_cc_offset = 0;          /* CC offset for subsequent video packets after injection */
     time_t last_cc_inject_time = 0;
     (void)pat_cc;
 
@@ -2226,9 +2213,18 @@ int main(int argc, char *argv[])
         }
 
         /* Extract PTS from video PES packets */
+        int cc_overflow_count = 0;
+        uint8_t cc_overflow_buf[MAX_CC_OVERFLOW * TS_PACKET_SIZE];
+
         if (video_pid != 0 && pid == video_pid) {
             int payload_start = (ts_packet[1] & 0x40) != 0;
             int keyframe_detected = 0;
+
+            /* Apply CC offset from previous injections to maintain CC sequence */
+            if (video_cc_offset > 0) {
+                uint8_t orig_cc = ts_packet[3] & 0x0F;
+                ts_packet[3] = (ts_packet[3] & 0xF0) | ((orig_cc + video_cc_offset) & 0x0F);
+            }
 
             /* Track video continuity counter for CC injection extra packets */
             video_cc_tracker = ts_packet[3] & 0x0F;
@@ -2244,7 +2240,6 @@ int main(int argc, char *argv[])
                 int payload_offset = 4;
 
                 if (afc == 2 || afc == 3) {
-                    /* Has adaptation field */
                     int adapt_len = ts_packet[4];
                     payload_offset = 5 + adapt_len;
                 }
@@ -2286,19 +2281,25 @@ int main(int argc, char *argv[])
                     pthread_mutex_unlock(&g_state.mutex);
 
                     if (cc_text[0] != '\0') {
-                        int extra = inject_cc_into_video_ts(ts_packet, cc_text,
-                                                            &video_cc_tracker,
-                                                            (unsigned int)now);
-                        packet_count += extra;
+                        cc_overflow_count = inject_cc_into_video_ts(
+                            ts_packet, cc_text, &video_cc_tracker,
+                            (unsigned int)now, cc_overflow_buf);
+                        video_cc_offset += cc_overflow_count;
                         last_cc_inject_time = now;
                     }
                 }
             }
         }
 
-        /* Pass through the current packet (possibly modified by CC608 injection) */
+        /* Write the current packet (PUSI first, before any overflow) */
         fwrite(ts_packet, 1, TS_PACKET_SIZE, stdout);
         packet_count++;
+
+        /* Write CC overflow continuation packets AFTER the PUSI packet */
+        for (int i = 0; i < cc_overflow_count; i++) {
+            fwrite(cc_overflow_buf + i * TS_PACKET_SIZE, 1, TS_PACKET_SIZE, stdout);
+            packet_count++;
+        }
 
         /* Subtitle injection: time-based with immediate inject on state change */
         if (have_video_pts && pmt_found) {
