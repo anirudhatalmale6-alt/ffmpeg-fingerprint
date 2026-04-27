@@ -44,6 +44,7 @@
 #define TS_PACKET_SIZE      188
 #define TS_SYNC_BYTE        0x47
 #define TS_PAT_PID          0x0000
+#define TS_SDT_PID          0x0011
 #define TS_NULL_PID         0x1FFF
 #define TS_MAX_PAYLOAD      184
 
@@ -1437,6 +1438,13 @@ static uint8_t original_pmt[TS_PACKET_SIZE];
 static int original_pmt_len = 0;
 static uint8_t original_pmt_version = 0; /* track original PMT version */
 
+/* SDT (Service Description Table) modification state */
+static int sdt_modify_enabled = 0;
+static uint8_t sdt_cc = 0;
+static uint16_t sdt_original_ts_id = 1;
+static uint16_t sdt_original_service_id = 1;
+static int sdt_parsed = 0;
+
 /* A/B audio watermark state */
 static int ab_audio_enabled = 0;
 static int ab_audio_segment_duration = 4;  /* seconds per A/B segment */
@@ -1714,6 +1722,123 @@ static int build_modified_pmt(uint8_t *out_ts)
     out_ts[3] = (out_ts[3] & 0xF0) | (pmt_cc & 0x0F);
     pmt_cc = (pmt_cc + 1) & 0x0F;
 
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  SDT (Service Description Table) modification                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Parse SDT to extract transport_stream_id and service_id.
+ */
+static void parse_sdt(const uint8_t *ts_packet)
+{
+    if (ts_packet[0] != TS_SYNC_BYTE) return;
+    int payload_start = (ts_packet[1] & 0x40) != 0;
+    if (!payload_start) return;
+
+    int has_adapt = (ts_packet[3] >> 5) & 0x01;
+    int offset = 4;
+    if (has_adapt) offset = 5 + ts_packet[4];
+    if (offset >= TS_PACKET_SIZE) return;
+
+    offset += ts_packet[offset] + 1;
+    if (offset + 11 >= TS_PACKET_SIZE) return;
+
+    uint8_t table_id = ts_packet[offset];
+    if (table_id != 0x42) return; /* SDT actual */
+
+    sdt_original_ts_id = (ts_packet[offset + 3] << 8) | ts_packet[offset + 4];
+    int sec_len = ((ts_packet[offset + 1] & 0x0F) << 8) | ts_packet[offset + 2];
+    int svc_start = offset + 11;
+    int svc_end = offset + 3 + sec_len - 4;
+
+    if (svc_start + 5 <= svc_end && svc_start + 5 < TS_PACKET_SIZE) {
+        sdt_original_service_id = (ts_packet[svc_start] << 8) | ts_packet[svc_start + 1];
+    }
+    sdt_parsed = 1;
+}
+
+/*
+ * Build a modified SDT that declares subtitle service availability.
+ * Adds service_descriptor with the subtitle language info so players
+ * that check SDT for service components discover the subtitle track.
+ */
+static int build_modified_sdt(uint8_t *out_ts)
+{
+    if (!pmt_found) return -1;
+
+    memset(out_ts, 0xFF, TS_PACKET_SIZE);
+
+    /* TS header */
+    out_ts[0] = TS_SYNC_BYTE;
+    out_ts[1] = 0x40 | ((TS_SDT_PID >> 8) & 0x1F); /* PUSI=1 */
+    out_ts[2] = TS_SDT_PID & 0xFF;
+    out_ts[3] = 0x10 | (sdt_cc & 0x0F); /* payload only */
+    sdt_cc = (sdt_cc + 1) & 0x0F;
+
+    /* Pointer field */
+    out_ts[4] = 0x00;
+
+    /* SDT section */
+    uint8_t sec[256];
+    int sp = 0;
+
+    sec[sp++] = 0x42; /* table_id = SDT actual */
+    sp += 2; /* section_length placeholder */
+    sec[sp++] = (sdt_original_ts_id >> 8) & 0xFF;
+    sec[sp++] = sdt_original_ts_id & 0xFF;
+    sec[sp++] = 0xC3; /* reserved(2)=11, version(5)=1, current_next(1)=1 */
+    sec[sp++] = 0x00; /* section_number */
+    sec[sp++] = 0x00; /* last_section_number */
+    sec[sp++] = 0xFF; /* original_network_id high */
+    sec[sp++] = 0x01; /* original_network_id low */
+    sec[sp++] = 0xFF; /* reserved */
+
+    /* Service loop entry */
+    sec[sp++] = (sdt_original_service_id >> 8) & 0xFF;
+    sec[sp++] = sdt_original_service_id & 0xFF;
+    sec[sp++] = 0xFC; /* reserved(6)=111111, EIT_schedule(1)=0, EIT_present(1)=0 */
+
+    /* Build service_descriptor (tag 0x48) */
+    /* service_type=1 (digital TV), provider="FP", service_name with language info */
+    char svc_name[64];
+    snprintf(svc_name, sizeof(svc_name), "TV [SUB:%s]", subtitle_lang);
+    int svc_name_len = strlen(svc_name);
+    int provider_len = 2; /* "FP" */
+    int desc_len = 1 + 1 + provider_len + 1 + svc_name_len;
+
+    /* descriptors_loop_length */
+    int desc_loop_len = 2 + desc_len;
+    sec[sp++] = 0x80 | ((desc_loop_len >> 8) & 0x0F); /* running_status=4(running), free_CA=0 */
+    sec[sp++] = desc_loop_len & 0xFF;
+
+    /* service_descriptor */
+    sec[sp++] = 0x48; /* tag */
+    sec[sp++] = desc_len & 0xFF;
+    sec[sp++] = 0x01; /* service_type: digital TV */
+    sec[sp++] = provider_len;
+    sec[sp++] = 'F'; sec[sp++] = 'P';
+    sec[sp++] = svc_name_len;
+    memcpy(sec + sp, svc_name, svc_name_len);
+    sp += svc_name_len;
+
+    /* section_length = (sp - 3) + CRC(4) */
+    int sec_len = sp - 3 + 4;
+    sec[1] = 0xF0 | ((sec_len >> 8) & 0x0F);
+    sec[2] = sec_len & 0xFF;
+
+    /* CRC32 */
+    uint32_t crc = calc_crc32(sec, sp);
+    sec[sp++] = (crc >> 24) & 0xFF;
+    sec[sp++] = (crc >> 16) & 0xFF;
+    sec[sp++] = (crc >>  8) & 0xFF;
+    sec[sp++] = crc & 0xFF;
+
+    if (5 + sp > TS_PACKET_SIZE) return -1;
+
+    memcpy(out_ts + 5, sec, sp);
     return 0;
 }
 
@@ -2042,6 +2167,8 @@ static void print_usage(const char *progname)
         "  --forced         Mark subtitle as hearing-impaired (auto-selects on some players)\n"
         "  --inject-interval N  Subtitle re-injection interval in seconds (default: 8)\n"
         "                   Lower = faster display on channel join, Higher = less overhead\n"
+        "  --sdt            Modify SDT to advertise subtitle service availability\n"
+        "                   Helps players discover the subtitle track on channel join\n"
         "  --cc             Inject CEA-608+708 closed captions into H.264 video stream\n"
         "                   CEA-708: random window positioning (anti-tamper)\n"
         "                   CEA-608: fixed bottom row (backwards compatibility)\n"
@@ -2128,6 +2255,8 @@ int main(int argc, char *argv[])
             if (inject_interval_sec > 30) inject_interval_sec = 30;
         } else if (strcmp(argv[i], "--cc") == 0 || strcmp(argv[i], "--cc608") == 0) {
             cc_enabled = 1;
+        } else if (strcmp(argv[i], "--sdt") == 0) {
+            sdt_modify_enabled = 1;
         } else if (strcmp(argv[i], "--ab-audio") == 0) {
             ab_audio_enabled = 1;
         } else if (strcmp(argv[i], "--ab-pattern") == 0 && i + 1 < argc) {
@@ -2212,6 +2341,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[ts_fingerprint]   CEA-708: random window positioning (anti-tamper)\n");
         fprintf(stderr, "[ts_fingerprint]   CEA-608: fixed bottom row (backwards compat)\n");
     }
+    if (sdt_modify_enabled) {
+        fprintf(stderr, "[ts_fingerprint] SDT modification: ENABLED (subtitle service advertised)\n");
+    }
     if (ab_audio_enabled) {
         fprintf(stderr, "[ts_fingerprint] A/B audio watermark: ENABLED\n");
         fprintf(stderr, "[ts_fingerprint]   Segment duration: %ds\n", ab_audio_segment_duration);
@@ -2291,6 +2423,25 @@ int main(int argc, char *argv[])
                     fwrite(modified_pmt, 1, TS_PACKET_SIZE, stdout);
                     packet_count++;
                     continue; /* already wrote modified PMT */
+                }
+            }
+        }
+
+        /* Parse and modify SDT */
+        if (pid == TS_SDT_PID) {
+            if (!sdt_parsed) {
+                parse_sdt(ts_packet);
+                if (sdt_parsed) {
+                    fprintf(stderr, "[ts_fingerprint] SDT: ts_id=%d service_id=%d\n",
+                            sdt_original_ts_id, sdt_original_service_id);
+                }
+            }
+            if (sdt_modify_enabled && inject_subtitle_to_pmt) {
+                uint8_t modified_sdt[TS_PACKET_SIZE];
+                if (build_modified_sdt(modified_sdt) == 0) {
+                    fwrite(modified_sdt, 1, TS_PACKET_SIZE, stdout);
+                    packet_count++;
+                    continue;
                 }
             }
         }

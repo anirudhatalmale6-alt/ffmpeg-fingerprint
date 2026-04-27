@@ -66,6 +66,8 @@ FP_FONT=""
 FP_STATS=""
 FP_DEFAULT_SUB=0
 FP_CC=0
+FP_SDT=0
+FP_DVBSUB_CODEC=0
 FP_BURN_IN=0
 FP_DUAL=0
 FP_BURN_PRESET="ultrafast"
@@ -87,6 +89,8 @@ CHILD_PIDS=()
 
 cleanup() {
     local exit_code=$?
+    # Clean temp SRT file if created
+    [ -n "${SRT_FILE:-}" ] && [ -f "${SRT_FILE:-}" ] && rm -f "$SRT_FILE" 2>/dev/null
     for pid in "${CHILD_PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null || true
@@ -123,6 +127,11 @@ Fingerprint Options:
                    CEA-708: random window positioning (anti-tamper)
                    CEA-608: fixed bottom row (backwards compatibility)
                    Auto-displays on ExoPlayer IPTV apps (iboPlayer, TiviMate, etc.)
+  --sdt            Modify SDT to advertise subtitle service to players
+                   Helps players discover the subtitle track on channel join
+  --dvbsub-codec   Use FFmpeg's built-in -c:s dvbsub encoder (use with --burn-in)
+                   Produces standard-compliant bitmap DVB subtitles via FFmpeg
+                   More compatible than custom injection on some players (iboPlayer)
   --default-sub    Add FFmpeg -disposition:s:0 default to output for VLC auto-display
   --burn-in        Burn text into video frames (uses CPU, works on ALL players)
                    Uses libx264 ultrafast. Guaranteed visible, no subtitle selection needed
@@ -240,6 +249,14 @@ while [ $# -gt 0 ]; do
             ;;
         --cc|--cc608)
             FP_CC=1
+            shift
+            ;;
+        --sdt)
+            FP_SDT=1
+            shift
+            ;;
+        --dvbsub-codec)
+            FP_DVBSUB_CODEC=1
             shift
             ;;
         --burn-in)
@@ -388,6 +405,10 @@ if [ "$FP_CC" -eq 1 ]; then
     TS_FP_ARGS+=(--cc)
 fi
 
+if [ "$FP_SDT" -eq 1 ]; then
+    TS_FP_ARGS+=(--sdt)
+fi
+
 if [ "$FP_AUDIO_WM" -eq 1 ]; then
     TS_FP_ARGS+=(--ab-audio)
 fi
@@ -448,6 +469,12 @@ if [ "$FP_FORCED" -eq 1 ]; then
 fi
 if [ "$FP_CC" -eq 1 ]; then
     echo "[ffmpeg_fingerprint]   CEA-608+708 captions: yes (random position, anti-tamper)" >&2
+fi
+if [ "$FP_SDT" -eq 1 ]; then
+    echo "[ffmpeg_fingerprint]   SDT modification: yes (subtitle service advertised)" >&2
+fi
+if [ "$FP_DVBSUB_CODEC" -eq 1 ]; then
+    echo "[ffmpeg_fingerprint]   FFmpeg dvbsub codec: yes (bitmap DVB subtitle via -c:s dvbsub)" >&2
 fi
 if [ "$FP_DUAL" -eq 1 ]; then
     echo "[ffmpeg_fingerprint]   Mode: DUAL (burn-in + DVB subtitle, maximum protection)" >&2
@@ -511,12 +538,30 @@ if [ "$FP_BURN_IN" -eq 1 ]; then
         DRAWTEXT="${DRAWTEXT}:fontfile=${BURN_FONT}"
     fi
 
+    # Generate SRT subtitle file for -c:s dvbsub mode
+    SRT_FILE=""
+    if [ "$FP_DVBSUB_CODEC" -eq 1 ]; then
+        SRT_FILE=$(mktemp /tmp/fp_sub_XXXXXX.srt)
+        # Create a long-duration SRT entry (24 hours) for live streams
+        cat > "$SRT_FILE" << SRTEOF
+1
+00:00:00,000 --> 23:59:59,000
+${FP_TEXT}
+SRTEOF
+        echo "[ffmpeg_fingerprint]   DVB subtitle codec: enabled (-c:s dvbsub via $SRT_FILE)" >&2
+    fi
+
     # Build the FFmpeg burn-in command (re-encodes video)
     BURN_CMD=("$FFMPEG" -hide_banner -loglevel error)
     if [ ${#FFMPEG_EXTRA_ARGS[@]} -gt 0 ]; then
         BURN_CMD+=("${FFMPEG_EXTRA_ARGS[@]}")
     fi
     BURN_CMD+=(-i "$INPUT")
+
+    # Add SRT subtitle input if dvbsub-codec enabled
+    if [ "$FP_DVBSUB_CODEC" -eq 1 ] && [ -n "$SRT_FILE" ]; then
+        BURN_CMD+=(-i "$SRT_FILE")
+    fi
 
     if [ "$FP_AUDIO_WM" -eq 1 ]; then
         # A/B audio watermark: generate two audio tracks with different ultrasonic tones
@@ -529,6 +574,17 @@ if [ "$FP_BURN_IN" -eq 1 ]; then
         BURN_CMD+=(-vf "$DRAWTEXT")
         BURN_CMD+=(-c:v libx264 -preset "$FP_BURN_PRESET" -tune zerolatency -crf "$FP_BURN_CRF")
         BURN_CMD+=(-c:a copy)
+    fi
+
+    # Add FFmpeg dvbsub codec for subtitle stream
+    if [ "$FP_DVBSUB_CODEC" -eq 1 ] && [ -n "$SRT_FILE" ]; then
+        BURN_CMD+=(-c:s dvbsub)
+        if [ "$FP_DEFAULT_SUB" -eq 1 ]; then
+            BURN_CMD+=(-disposition:s:0 default+forced)
+        else
+            BURN_CMD+=(-disposition:s:0 forced)
+        fi
+        BURN_CMD+=(-metadata:s:s:0 "language=${FP_LANG:-eng}")
     fi
 
     # In dual mode, pipe through ts_fingerprint to add DVB subtitle too
