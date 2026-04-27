@@ -1430,11 +1430,21 @@ static int build_ts_packets(uint16_t pid, const uint8_t *pes_payload,
 /* State for tracking original stream PIDs */
 static uint16_t video_pid = 0;
 static uint16_t audio_pid = 0;
+static uint16_t audio_pid_b = 0;       /* second audio PID for A/B watermark */
 static uint16_t pmt_pid = 0;
 static int pmt_found = 0;
 static uint8_t original_pmt[TS_PACKET_SIZE];
 static int original_pmt_len = 0;
 static uint8_t original_pmt_version = 0; /* track original PMT version */
+
+/* A/B audio watermark state */
+static int ab_audio_enabled = 0;
+static int ab_audio_segment_duration = 4;  /* seconds per A/B segment */
+static uint8_t ab_audio_pattern[256];      /* binary pattern bits */
+static int ab_audio_pattern_len = 0;
+static int ab_audio_segment_idx = 0;
+static time_t ab_audio_last_switch = 0;
+static uint8_t ab_audio_out_cc = 0;        /* output CC counter for selected audio */
 
 /*
  * Parse PAT to find PMT PID
@@ -1537,6 +1547,8 @@ static void parse_pmt(const uint8_t *ts_packet)
             if (audio_pid == 0) {
                 audio_pid = elem_pid;
                 g_stats.audio_stream_type = stream_type;
+            } else if (audio_pid_b == 0 && elem_pid != audio_pid) {
+                audio_pid_b = elem_pid;
             }
         }
 
@@ -1653,6 +1665,8 @@ static int build_modified_pmt(uint8_t *out_ts)
             sec[sp++] = 0x7F; /* digital_cc=0, reserved=1, reserved=11111, line21_field=1 */
             sec[sp++] = 0x3F;
             sec[sp++] = 0xFF;
+        } else if (ab_audio_enabled && audio_pid_b != 0 && epid == audio_pid_b) {
+            /* A/B audio: skip second audio PID from output PMT */
         } else {
             /* Copy stream entry verbatim */
             int entry_size = 5 + es_len;
@@ -1874,6 +1888,38 @@ static void *zmq_thread_func(void *arg)
             pthread_mutex_unlock(&g_state.mutex);
             continue;
 
+        } else if (strncmp(buf, "AB_PATTERN ", 11) == 0) {
+            char *pat = buf + 11;
+            int plen = strlen(pat);
+            if (plen > 256) plen = 256;
+            ab_audio_pattern_len = 0;
+            for (int i = 0; i < plen; i++) {
+                if (pat[i] == '0' || pat[i] == '1') {
+                    ab_audio_pattern[ab_audio_pattern_len++] = pat[i] - '0';
+                }
+            }
+            ab_audio_segment_idx = 0;
+            ab_audio_last_switch = 0;
+            if (ab_audio_pattern_len > 0) {
+                ab_audio_enabled = 1;
+                inject_subtitle_to_pmt = 1;
+            }
+            snprintf(reply, sizeof(reply), "OK ab_pattern_len=%d", ab_audio_pattern_len);
+            fprintf(stderr, "[ts_fingerprint] AB_PATTERN set (%d bits)\n", ab_audio_pattern_len);
+
+        } else if (strcmp(buf, "AB_STATUS") == 0) {
+            snprintf(reply, sizeof(reply),
+                     "ab_enabled=%d ab_bits=%d ab_segment=%d audio_a=0x%04X audio_b=0x%04X",
+                     ab_audio_enabled, ab_audio_pattern_len,
+                     ab_audio_segment_idx, audio_pid, audio_pid_b);
+
+        } else if (strcmp(buf, "AB_DISABLE") == 0) {
+            ab_audio_enabled = 0;
+            ab_audio_pattern_len = 0;
+            ab_audio_segment_idx = 0;
+            snprintf(reply, sizeof(reply), "OK ab_disabled");
+            fprintf(stderr, "[ts_fingerprint] AB_AUDIO disabled\n");
+
         } else {
             snprintf(reply, sizeof(reply), "ERR unknown command");
         }
@@ -2002,6 +2048,13 @@ static void print_usage(const char *progname)
         "                   Auto-displays on ExoPlayer apps (iboPlayer, TiviMate, etc.)\n"
         "                   Zero re-encoding - injects SEI NAL units into existing video\n"
         "\n"
+        "A/B Audio Watermark Options:\n"
+        "  --ab-audio       Enable A/B audio watermark selection\n"
+        "                   Requires input stream with 2 audio PIDs (variant A and B)\n"
+        "  --ab-pattern PAT Binary pattern string (e.g. 01101001) for A/B selection\n"
+        "                   Can also be set dynamically via ZMQ AB_PATTERN command\n"
+        "  --ab-segment-duration N  Seconds per A/B segment (default: 4)\n"
+        "\n"
         "Stream Statistics (built-in ffprobe):\n"
         "  --stats N        Print stream stats to stderr every N seconds (0=off)\n"
         "                   Stats also available via ZMQ STATS/STATS_JSON commands\n"
@@ -2013,6 +2066,9 @@ static void print_usage(const char *progname)
         "  STATUS               Get fingerprint state\n"
         "  STATS                Get real-time stream statistics (text format)\n"
         "  STATS_JSON           Get real-time stream statistics (JSON format)\n"
+        "  AB_PATTERN <bits>    Set A/B audio pattern (e.g. 01101001001011)\n"
+        "  AB_STATUS            Get A/B audio watermark state\n"
+        "  AB_DISABLE           Disable A/B audio watermark\n"
         "\n"
         "Examples:\n"
         "  # Basic fingerprint with stream monitoring:\n"
@@ -2072,6 +2128,21 @@ int main(int argc, char *argv[])
             if (inject_interval_sec > 30) inject_interval_sec = 30;
         } else if (strcmp(argv[i], "--cc") == 0 || strcmp(argv[i], "--cc608") == 0) {
             cc_enabled = 1;
+        } else if (strcmp(argv[i], "--ab-audio") == 0) {
+            ab_audio_enabled = 1;
+        } else if (strcmp(argv[i], "--ab-pattern") == 0 && i + 1 < argc) {
+            const char *pat = argv[++i];
+            ab_audio_pattern_len = 0;
+            for (int j = 0; pat[j] && ab_audio_pattern_len < 256; j++) {
+                if (pat[j] == '0' || pat[j] == '1') {
+                    ab_audio_pattern[ab_audio_pattern_len++] = pat[j] - '0';
+                }
+            }
+            if (ab_audio_pattern_len > 0) ab_audio_enabled = 1;
+        } else if (strcmp(argv[i], "--ab-segment-duration") == 0 && i + 1 < argc) {
+            ab_audio_segment_duration = atoi(argv[++i]);
+            if (ab_audio_segment_duration < 1) ab_audio_segment_duration = 1;
+            if (ab_audio_segment_duration > 30) ab_audio_segment_duration = 30;
         } else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) {
             stats_stderr_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -2141,6 +2212,14 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[ts_fingerprint]   CEA-708: random window positioning (anti-tamper)\n");
         fprintf(stderr, "[ts_fingerprint]   CEA-608: fixed bottom row (backwards compat)\n");
     }
+    if (ab_audio_enabled) {
+        fprintf(stderr, "[ts_fingerprint] A/B audio watermark: ENABLED\n");
+        fprintf(stderr, "[ts_fingerprint]   Segment duration: %ds\n", ab_audio_segment_duration);
+        if (ab_audio_pattern_len > 0)
+            fprintf(stderr, "[ts_fingerprint]   Pattern: %d bits (set via CLI)\n", ab_audio_pattern_len);
+        else
+            fprintf(stderr, "[ts_fingerprint]   Pattern: awaiting ZMQ AB_PATTERN command\n");
+    }
     fprintf(stderr, "[ts_fingerprint] Processing MPEG-TS stream...\n");
 
     while (1) {
@@ -2198,6 +2277,10 @@ int main(int argc, char *argv[])
                 if (pmt_found) {
                     fprintf(stderr, "[ts_fingerprint] Found video PID=0x%04X audio PID=0x%04X\n",
                             video_pid, audio_pid);
+                    if (audio_pid_b != 0) {
+                        fprintf(stderr, "[ts_fingerprint] Found audio PID B=0x%04X (A/B watermark ready)\n",
+                                audio_pid_b);
+                    }
                 }
             }
 
@@ -2289,6 +2372,36 @@ int main(int argc, char *argv[])
                     }
                 }
             }
+        }
+
+        /* A/B audio watermark: select variant A or B per segment */
+        if (ab_audio_enabled && audio_pid_b != 0 && ab_audio_pattern_len > 0 &&
+            (pid == audio_pid || pid == audio_pid_b)) {
+            time_t now_ab = time(NULL);
+            if (ab_audio_last_switch == 0) ab_audio_last_switch = now_ab;
+            if (difftime(now_ab, ab_audio_last_switch) >= ab_audio_segment_duration) {
+                ab_audio_segment_idx++;
+                ab_audio_last_switch = now_ab;
+            }
+
+            int current_bit = ab_audio_pattern[ab_audio_segment_idx % ab_audio_pattern_len];
+            uint16_t wanted_pid = (current_bit == 0) ? audio_pid : audio_pid_b;
+
+            if (pid == wanted_pid) {
+                /* Rewrite PID to audio_pid so output always has one consistent PID */
+                ts_packet[1] = (ts_packet[1] & 0xE0) | ((audio_pid >> 8) & 0x1F);
+                ts_packet[2] = audio_pid & 0xFF;
+                /* Rewrite CC to maintain continuity */
+                int has_payload = (ts_packet[3] >> 4) & 0x01;
+                if (has_payload) {
+                    ts_packet[3] = (ts_packet[3] & 0xF0) | (ab_audio_out_cc & 0x0F);
+                    ab_audio_out_cc = (ab_audio_out_cc + 1) & 0x0F;
+                }
+                fwrite(ts_packet, 1, TS_PACKET_SIZE, stdout);
+                packet_count++;
+            }
+            /* else: drop packets from non-selected variant */
+            continue;
         }
 
         /* Write the current packet (PUSI first, before any overflow) */

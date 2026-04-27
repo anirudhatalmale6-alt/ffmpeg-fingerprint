@@ -9,3 +9,4 @@ demo/short_*
 demo/*.log
 demo/frame_*
 demo/demo_rendered.mp4
+cc_test.log

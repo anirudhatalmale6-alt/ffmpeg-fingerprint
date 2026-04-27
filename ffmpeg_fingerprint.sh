@@ -70,6 +70,12 @@ FP_BURN_IN=0
 FP_DUAL=0
 FP_BURN_PRESET="ultrafast"
 FP_BURN_CRF="23"
+FP_AUDIO_WM=0
+FP_AB_PATTERN=""
+FP_AB_SEG_DUR=""
+FP_TONE_A="18500"
+FP_TONE_B="19500"
+FP_TONE_VOLUME="0.003"
 INPUT=""
 OUTPUT=""
 OUTPUT_FMT=""
@@ -124,6 +130,13 @@ Fingerprint Options:
                    Text in video frames AND subtitle track for all players/devices
   --burn-preset P  x264 preset for burn-in mode (default: ultrafast)
   --burn-crf N     x264 CRF quality for burn-in mode (default: 23, lower=better)
+  --audio-watermark  Enable A/B audio watermark (use with --burn-in)
+                   Generates 2 audio tracks with different inaudible tones
+                   ts_fingerprint selects A or B per segment per user
+  --ab-pattern PAT Binary pattern for A/B selection (e.g. 01101001001011)
+  --ab-segment-duration N  Seconds per A/B segment (default: 4)
+  --tone-a HZ      Frequency for tone A (default: 18500)
+  --tone-b HZ      Frequency for tone B (default: 19500)
   --stats N        Print stream stats to stderr every N seconds
 
 FFmpeg Options (passed through):
@@ -248,6 +261,31 @@ while [ $# -gt 0 ]; do
             FP_BURN_CRF="$2"
             shift 2
             ;;
+        --audio-watermark)
+            FP_AUDIO_WM=1
+            shift
+            ;;
+        --ab-pattern)
+            [ $# -ge 2 ] || { echo "Error: --ab-pattern requires a binary string" >&2; exit 1; }
+            FP_AB_PATTERN="$2"
+            FP_AUDIO_WM=1
+            shift 2
+            ;;
+        --ab-segment-duration)
+            [ $# -ge 2 ] || { echo "Error: --ab-segment-duration requires seconds" >&2; exit 1; }
+            FP_AB_SEG_DUR="$2"
+            shift 2
+            ;;
+        --tone-a)
+            [ $# -ge 2 ] || { echo "Error: --tone-a requires frequency in Hz" >&2; exit 1; }
+            FP_TONE_A="$2"
+            shift 2
+            ;;
+        --tone-b)
+            [ $# -ge 2 ] || { echo "Error: --tone-b requires frequency in Hz" >&2; exit 1; }
+            FP_TONE_B="$2"
+            shift 2
+            ;;
         --stats)
             [ $# -ge 2 ] || { echo "Error: --stats requires interval in seconds" >&2; exit 1; }
             FP_STATS="$2"
@@ -350,6 +388,18 @@ if [ "$FP_CC" -eq 1 ]; then
     TS_FP_ARGS+=(--cc)
 fi
 
+if [ "$FP_AUDIO_WM" -eq 1 ]; then
+    TS_FP_ARGS+=(--ab-audio)
+fi
+
+if [ -n "$FP_AB_PATTERN" ]; then
+    TS_FP_ARGS+=(--ab-pattern "$FP_AB_PATTERN")
+fi
+
+if [ -n "$FP_AB_SEG_DUR" ]; then
+    TS_FP_ARGS+=(--ab-segment-duration "$FP_AB_SEG_DUR")
+fi
+
 if [ -n "$FP_STATS" ]; then
     TS_FP_ARGS+=(--stats "$FP_STATS")
 fi
@@ -408,6 +458,12 @@ elif [ "$FP_BURN_IN" -eq 1 ]; then
 else
     echo "[ffmpeg_fingerprint]   Mode: DVB subtitle (zero CPU)" >&2
 fi
+if [ "$FP_AUDIO_WM" -eq 1 ]; then
+    echo "[ffmpeg_fingerprint]   Audio watermark: A/B tone selection (${FP_TONE_A}Hz / ${FP_TONE_B}Hz)" >&2
+    if [ -n "$FP_AB_PATTERN" ]; then
+        echo "[ffmpeg_fingerprint]   A/B pattern: ${FP_AB_PATTERN:0:20}... (${#FP_AB_PATTERN} bits)" >&2
+    fi
+fi
 if [ -n "$FP_STATS" ]; then
     echo "[ffmpeg_fingerprint]   Stats interval: ${FP_STATS}s" >&2
 fi
@@ -461,9 +517,19 @@ if [ "$FP_BURN_IN" -eq 1 ]; then
         BURN_CMD+=("${FFMPEG_EXTRA_ARGS[@]}")
     fi
     BURN_CMD+=(-i "$INPUT")
-    BURN_CMD+=(-vf "$DRAWTEXT")
-    BURN_CMD+=(-c:v libx264 -preset "$FP_BURN_PRESET" -tune zerolatency -crf "$FP_BURN_CRF")
-    BURN_CMD+=(-c:a copy)
+
+    if [ "$FP_AUDIO_WM" -eq 1 ]; then
+        # A/B audio watermark: generate two audio tracks with different ultrasonic tones
+        BURN_CMD+=(-filter_complex
+            "[0:v]${DRAWTEXT}[vout];[0:a]asplit=2[a1][a2];sine=frequency=${FP_TONE_A}:sample_rate=48000[ta];sine=frequency=${FP_TONE_B}:sample_rate=48000[tb];[a1][ta]amix=inputs=2:weights=1 ${FP_TONE_VOLUME}[outa];[a2][tb]amix=inputs=2:weights=1 ${FP_TONE_VOLUME}[outb]")
+        BURN_CMD+=(-map "[vout]" -map "[outa]" -map "[outb]")
+        BURN_CMD+=(-c:v libx264 -preset "$FP_BURN_PRESET" -tune zerolatency -crf "$FP_BURN_CRF")
+        BURN_CMD+=(-c:a aac -b:a 128k)
+    else
+        BURN_CMD+=(-vf "$DRAWTEXT")
+        BURN_CMD+=(-c:v libx264 -preset "$FP_BURN_PRESET" -tune zerolatency -crf "$FP_BURN_CRF")
+        BURN_CMD+=(-c:a copy)
+    fi
 
     # In dual mode, pipe through ts_fingerprint to add DVB subtitle too
     if [ "$FP_DUAL" -eq 1 ]; then
