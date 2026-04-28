@@ -59,6 +59,7 @@ ZMQ_ADDR=""
 FP_TEXT=""
 FP_POSITION=""
 FP_LANG=""
+FP_AUTO_LANG=0
 FP_DISPLAY=""
 FP_FONTSCALE=""
 FP_FORCED=0
@@ -119,6 +120,8 @@ Fingerprint Options:
   --text TEXT      Initial/static fingerprint text
   --position N     Position 0-8 (-1=random, default=-1 random)
   --lang CODE      Subtitle language code (default: eng)
+  --auto-lang      Auto-match subtitle language to audio language from stream
+                   Improves auto-selection on IPTV apps (IBO, TiviMate, etc.)
   --display WxH    Display resolution (default: 1920x1080)
                    720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K
   --fontscale N    Font scale 1-4 (default: auto based on display)
@@ -224,6 +227,10 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || { echo "Error: --lang requires a code" >&2; exit 1; }
             FP_LANG="$2"
             shift 2
+            ;;
+        --auto-lang)
+            FP_AUTO_LANG=1
+            shift
             ;;
         --display)
             [ $# -ge 2 ] || { echo "Error: --display requires WxH" >&2; exit 1; }
@@ -394,6 +401,10 @@ if [ -n "$FP_LANG" ]; then
     TS_FP_ARGS+=(--lang "$FP_LANG")
 fi
 
+if [ "$FP_AUTO_LANG" -eq 1 ]; then
+    TS_FP_ARGS+=(--auto-lang)
+fi
+
 if [ -n "$FP_DISPLAY" ]; then
     TS_FP_ARGS+=(--display "$FP_DISPLAY")
 fi
@@ -485,6 +496,9 @@ if [ "$FP_CC" -eq 1 ]; then
 fi
 if [ "$FP_SDT" -eq 1 ]; then
     echo "[ffmpeg_fingerprint]   SDT modification: yes (subtitle service advertised)" >&2
+fi
+if [ "$FP_AUTO_LANG" -eq 1 ]; then
+    echo "[ffmpeg_fingerprint]   Auto-lang: yes (subtitle matches audio language)" >&2
 fi
 if [ "$FP_DVBSUB_CODEC" -eq 1 ]; then
     echo "[ffmpeg_fingerprint]   FFmpeg dvbsub codec: yes (bitmap DVB subtitle via -c:s dvbsub)" >&2

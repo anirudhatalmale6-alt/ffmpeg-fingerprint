@@ -1433,8 +1433,10 @@ static uint8_t subtitle_cc = 0; /* continuity counter for subtitle PID */
 static uint8_t pat_cc = 0;
 static uint8_t pmt_cc = 0;
 
-/* Subtitle language code for PMT descriptor (configurable via --lang) */
+/* Subtitle language code for PMT descriptor (configurable via --lang or --auto-lang) */
 static char subtitle_lang[4] = "eng";
+static int auto_lang_enabled = 0;  /* --auto-lang: copy audio language to subtitle */
+static char detected_audio_lang[4] = {0};
 
 /* Only add subtitle PID to PMT after first SHOW (avoids black bar on STBs) */
 static int inject_subtitle_to_pmt = 0;
@@ -1686,6 +1688,37 @@ static void parse_pmt(const uint8_t *ts_packet)
             if (audio_pid == 0) {
                 audio_pid = elem_pid;
                 g_stats.audio_stream_type = stream_type;
+
+                /* Extract audio language from ISO 639 descriptor (tag 0x0A) */
+                if (auto_lang_enabled && es_info_length >= 4) {
+                    int d = i + 5;
+                    int d_end = d + es_info_length;
+                    if (d_end > stream_end) d_end = stream_end;
+                    while (d + 2 <= d_end) {
+                        uint8_t dtag = ts_packet[d];
+                        uint8_t dlen = ts_packet[d + 1];
+                        if (dtag == 0x0A && dlen >= 3 && d + 2 + 3 <= d_end) {
+                            char lang[4];
+                            lang[0] = ts_packet[d + 2];
+                            lang[1] = ts_packet[d + 3];
+                            lang[2] = ts_packet[d + 4];
+                            lang[3] = '\0';
+                            if (lang[0] >= 'a' && lang[0] <= 'z' &&
+                                lang[1] >= 'a' && lang[1] <= 'z' &&
+                                lang[2] >= 'a' && lang[2] <= 'z') {
+                                if (memcmp(detected_audio_lang, lang, 3) != 0) {
+                                    memcpy(detected_audio_lang, lang, 4);
+                                    memcpy(subtitle_lang, lang, 4);
+                                    fprintf(stderr,
+                                        "[ts_fingerprint] Auto-lang: matched subtitle to audio language '%s'\n",
+                                        subtitle_lang);
+                                }
+                            }
+                            break;
+                        }
+                        d += 2 + dlen;
+                    }
+                }
             } else if (audio_pid_b == 0 && elem_pid != audio_pid) {
                 audio_pid_b = elem_pid;
             }
@@ -2144,6 +2177,18 @@ static void *zmq_thread_func(void *arg)
             pthread_mutex_unlock(&g_state.mutex);
             continue;
 
+        } else if (strncmp(buf, "LANG ", 5) == 0) {
+            char *lang = buf + 5;
+            while (*lang == ' ') lang++;
+            if (strlen(lang) >= 3) {
+                strncpy(subtitle_lang, lang, 3);
+                subtitle_lang[3] = '\0';
+                snprintf(reply, sizeof(reply), "OK lang=%s", subtitle_lang);
+                fprintf(stderr, "[ts_fingerprint] LANG set to '%s'\n", subtitle_lang);
+            } else {
+                snprintf(reply, sizeof(reply), "ERR lang requires 3-letter code");
+            }
+
         } else if (strncmp(buf, "AB_PATTERN ", 11) == 0) {
             char *pat = buf + 11;
             int plen = strlen(pat);
@@ -2291,6 +2336,8 @@ static void print_usage(const char *progname)
         "  --text TEXT       Initial fingerprint text\n"
         "  --position N     Position 0-8 (-1=random, default=-1)\n"
         "  --lang CODE      Subtitle language code (default: eng)\n"
+        "  --auto-lang      Auto-match subtitle language to audio language from PMT\n"
+        "                   Improves auto-selection on IPTV apps (IBO, TiviMate, etc.)\n"
         "  --display WxH    Display resolution (default: 1920x1080)\n"
         "                   Use 720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K\n"
         "  --fontscale N    Font scale factor 1-4 (default: auto based on display)\n"
@@ -2328,6 +2375,7 @@ static void print_usage(const char *progname)
         "  STATUS               Get fingerprint state\n"
         "  STATS                Get real-time stream statistics (text format)\n"
         "  STATS_JSON           Get real-time stream statistics (JSON format)\n"
+        "  LANG <code>          Set subtitle language (e.g. LANG tur)\n"
         "  AB_PATTERN <bits>    Set A/B audio pattern (e.g. 01101001001011)\n"
         "  AB_STATUS            Get A/B audio watermark state\n"
         "  AB_DISABLE           Disable A/B audio watermark\n"
@@ -2366,6 +2414,8 @@ int main(int argc, char *argv[])
             const char *lang = argv[++i];
             strncpy(subtitle_lang, lang, 3);
             subtitle_lang[3] = '\0';
+        } else if (strcmp(argv[i], "--auto-lang") == 0) {
+            auto_lang_enabled = 1;
         } else if (strcmp(argv[i], "--display") == 0 && i + 1 < argc) {
             if (sscanf(argv[++i], "%dx%d", &display_width, &display_height) != 2) {
                 fprintf(stderr, "Invalid display format, use WxH (e.g., 1920x1080)\n");
@@ -2481,6 +2531,11 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[ts_fingerprint]   CEA-608: fixed bottom row (backwards compat)\n");
     }
     fprintf(stderr, "[ts_fingerprint] DVB subtitle pixel depth: %d-bit\n", dvb_pixel_depth);
+    if (auto_lang_enabled) {
+        fprintf(stderr, "[ts_fingerprint] Auto-lang: ENABLED (subtitle language follows audio)\n");
+    } else {
+        fprintf(stderr, "[ts_fingerprint] Subtitle language: %s\n", subtitle_lang);
+    }
     if (sdt_modify_enabled) {
         fprintf(stderr, "[ts_fingerprint] SDT modification: ENABLED (subtitle service advertised)\n");
     }
