@@ -67,6 +67,7 @@ FP_STATS=""
 FP_DEFAULT_SUB=0
 FP_CC=0
 FP_SDT=0
+FP_DVB_DEPTH=""
 FP_DVBSUB_CODEC=0
 FP_BURN_IN=0
 FP_DUAL=0
@@ -251,6 +252,14 @@ while [ $# -gt 0 ]; do
             FP_CC=1
             shift
             ;;
+        --dvb-2bit)
+            FP_DVB_DEPTH="2bit"
+            shift
+            ;;
+        --dvb-4bit)
+            FP_DVB_DEPTH="4bit"
+            shift
+            ;;
         --sdt)
             FP_SDT=1
             shift
@@ -403,6 +412,10 @@ fi
 
 if [ "$FP_CC" -eq 1 ]; then
     TS_FP_ARGS+=(--cc)
+fi
+
+if [ -n "$FP_DVB_DEPTH" ]; then
+    TS_FP_ARGS+=(--dvb-${FP_DVB_DEPTH})
 fi
 
 if [ "$FP_SDT" -eq 1 ]; then

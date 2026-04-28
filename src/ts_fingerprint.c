@@ -195,6 +195,9 @@ static int font_scale = 2; /* auto: 1 for SD, 2 for 1080p, 3 for 4K */
 /* Subtitle type: 0x10=normal, 0x20=hearing_impaired (auto-selects on some players) */
 static uint8_t subtitling_type = 0x10;
 
+/* DVB subtitle pixel depth: 8=8-bit (default), 2=2-bit (max IPTV compat), 4=4-bit */
+static int dvb_pixel_depth = 8;
+
 /* TTF font support */
 static uint8_t *ttf_font_data = NULL;
 static stbtt_fontinfo ttf_font_info;
@@ -631,6 +634,112 @@ static uint8_t *render_text_bitmap(const char *text, int region_w, int text_x,
 }
 
 /*
+ * Encode one field of DVB subtitle pixel data using 2-bit/pixel coding.
+ * DVB spec EN 300 743, Table 11. Maximum IPTV app compatibility.
+ *
+ * 2-bit codes (within a bitstream):
+ *   01, 10, 11 = literal pixel of that color
+ *   00 = switch code:
+ *     next 2 bits = 00: end_of_string_signal
+ *     next 2 bits = 01: 1 pixel of pseudo-color 0 (transparent)
+ *     next 2 bits = 10: next 4 bits = run_length-3 (3-6), next 2 bits = color
+ *     next 2 bits = 11: next 8 bits = run_length-29 (29-284), next 2 bits = color
+ */
+static int encode_dvb_rle_2bit_field(const uint8_t *bitmap, int w, int h,
+                                      int field, uint8_t **out_buf, int *out_size)
+{
+    int lines_in_field = (h + 1 - field) / 2;
+    int max_size = lines_in_field * (1 + w * 4 + 4) + 64;
+    uint8_t *buf = malloc(max_size);
+    if (!buf) return -1;
+
+    int pos = 0;
+
+    for (int y = field; y < h; y += 2) {
+        buf[pos++] = 0x10; /* data_type: 2-bit/pixel code string */
+
+        const uint8_t *row = bitmap + y * w;
+        int bit_pos = 0;
+        uint8_t byte_acc = 0;
+
+#define WRITE_BITS_2(val, nbits) do { \
+    for (int _b = (nbits) - 1; _b >= 0; _b--) { \
+        byte_acc = (byte_acc << 1) | (((val) >> _b) & 1); \
+        bit_pos++; \
+        if (bit_pos == 8) { buf[pos++] = byte_acc; byte_acc = 0; bit_pos = 0; } \
+    } \
+} while(0)
+
+        for (int x = 0; x < w; ) {
+            uint8_t pixel = row[x] & 0x03;
+            if (pixel != 0) {
+                WRITE_BITS_2(pixel, 2);
+                x++;
+            } else {
+                int run = 0;
+                while (x + run < w && (row[x + run] & 0x03) == 0) run++;
+                int remaining = run;
+                while (remaining > 0) {
+                    if (remaining == 1) {
+                        WRITE_BITS_2(0, 2);  /* switch */
+                        WRITE_BITS_2(1, 2);  /* 01 = 1 pixel of color 0 */
+                        remaining -= 1;
+                    } else if (remaining >= 3 && remaining <= 6) {
+                        WRITE_BITS_2(0, 2);  /* switch */
+                        WRITE_BITS_2(2, 2);  /* 10 = run 3-6 */
+                        WRITE_BITS_2(remaining - 3, 4);
+                        WRITE_BITS_2(0, 2);  /* color 0 */
+                        remaining = 0;
+                    } else if (remaining == 2) {
+                        WRITE_BITS_2(0, 2); WRITE_BITS_2(1, 2);
+                        WRITE_BITS_2(0, 2); WRITE_BITS_2(1, 2);
+                        remaining -= 2;
+                    } else {
+                        int rlen = remaining;
+                        if (rlen > 284) rlen = 284;
+                        if (rlen < 29) rlen = (rlen > 6) ? 6 : rlen;
+                        if (rlen >= 29) {
+                            WRITE_BITS_2(0, 2);
+                            WRITE_BITS_2(3, 2);  /* 11 = run 29-284 */
+                            WRITE_BITS_2(rlen - 29, 8);
+                            WRITE_BITS_2(0, 2);
+                            remaining -= rlen;
+                        } else {
+                            WRITE_BITS_2(0, 2);
+                            WRITE_BITS_2(2, 2);
+                            WRITE_BITS_2(rlen - 3, 4);
+                            WRITE_BITS_2(0, 2);
+                            remaining -= rlen;
+                        }
+                    }
+                }
+                x += run;
+            }
+        }
+
+        /* end_of_string: 00 00 */
+        WRITE_BITS_2(0, 2);
+        WRITE_BITS_2(0, 2);
+
+        /* Byte-align */
+        if (bit_pos > 0) {
+            byte_acc <<= (8 - bit_pos);
+            buf[pos++] = byte_acc;
+            byte_acc = 0;
+            bit_pos = 0;
+        }
+
+#undef WRITE_BITS_2
+
+        buf[pos++] = 0xF0; /* end_of_object_line */
+    }
+
+    *out_buf = buf;
+    *out_size = pos;
+    return 0;
+}
+
+/*
  * Encode bitmap as DVB subtitle pixel data using 8-bit/pixel coding.
  * DVB spec EN 300 743, Table 14: 8-bit/pixel code string
  *
@@ -768,8 +877,13 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     /* Encode bitmap to RLE - separate top and bottom fields (interlaced DVB) */
     uint8_t *top_field = NULL, *bottom_field = NULL;
     int top_size = 0, bottom_size = 0;
-    encode_dvb_rle_8bit_field(bitmap, bmp_w, bmp_h, 0, &top_field, &top_size);
-    encode_dvb_rle_8bit_field(bitmap, bmp_w, bmp_h, 1, &bottom_field, &bottom_size);
+    if (dvb_pixel_depth == 2) {
+        encode_dvb_rle_2bit_field(bitmap, bmp_w, bmp_h, 0, &top_field, &top_size);
+        encode_dvb_rle_2bit_field(bitmap, bmp_w, bmp_h, 1, &bottom_field, &bottom_size);
+    } else {
+        encode_dvb_rle_8bit_field(bitmap, bmp_w, bmp_h, 0, &top_field, &top_size);
+        encode_dvb_rle_8bit_field(bitmap, bmp_w, bmp_h, 1, &bottom_field, &bottom_size);
+    }
     free(bitmap);
 
     if (!top_field || !bottom_field) {
@@ -839,9 +953,16 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     put_be16(pes + p, bmp_h); p += 2; /* region_height */
     /*
      * region_level_of_compatibility(3b) + region_depth(3b) + reserved(2b)
-     * For 8-bit depth: compatibility=011(8bit), depth=011(8bit) = 0x6C
+     * 2-bit: compatibility=001, depth=001 = 0x24
+     * 4-bit: compatibility=010, depth=010 = 0x48
+     * 8-bit: compatibility=011, depth=011 = 0x6C
      */
-    pes[p++] = 0x6C;
+    if (dvb_pixel_depth == 2)
+        pes[p++] = 0x24;
+    else if (dvb_pixel_depth == 4)
+        pes[p++] = 0x48;
+    else
+        pes[p++] = 0x6C;
     pes[p++] = 0x00; /* CLUT_id = 0 */
     pes[p++] = 0x00; /* region_8-bit_pixel_code (background) */
     pes[p++] = 0x00; /* region_4-bit_pixel_code(4b)=0 + region_2-bit_pixel_code(2b)=0 + reserved(2b) */
@@ -869,28 +990,38 @@ static int build_dvb_subtitle_pes(const char *text, int position,
      *   T = 0xFF means fully TRANSPARENT
      */
     /*
-     * CLUT entry flags: 0xE1 = populate ALL tables (2-bit + 4-bit + 8-bit) + full_range
-     * This ensures all decoders find our colors regardless of which table they use.
-     * Data is read once per entry: Y(8b), Cr(8b), Cb(8b), T(8b)
+     * CLUT entry flags:
+     *   0xE1 = populate ALL tables (2-bit + 4-bit + 8-bit) + full_range
+     *   0x21 = populate 2-bit table only + full_range
+     *   0x41 = populate 4-bit table only + full_range
+     *   0x81 = populate 8-bit table only + full_range
+     *
+     * Use matching flag for pixel depth to ensure decoder reads the right table.
+     * Data per entry: Y(8b), Cr(8b), Cb(8b), T(8b)
      * T convention: 0x00 = opaque, 0xFF = transparent (FFmpeg/DVB standard)
      */
+    uint8_t clut_flag = 0xE1; /* all tables */
+    if (dvb_pixel_depth == 2) clut_flag = 0x21;
+    else if (dvb_pixel_depth == 4) clut_flag = 0x41;
+    else if (dvb_pixel_depth == 8) clut_flag = 0x81;
+
     /* Entry 0: fully transparent (background/unused) */
     pes[p++] = 0x00; /* CLUT_entry_id = 0 */
-    pes[p++] = 0xE1; /* 2-bit + 4-bit + 8-bit CLUT flags + full_range */
+    pes[p++] = clut_flag;
     pes[p++] = 0x00; /* Y = 0 */
     pes[p++] = 0x80; /* Cr = 128 (neutral) */
     pes[p++] = 0x80; /* Cb = 128 (neutral) */
     pes[p++] = 0xFF; /* T = 0xFF (fully transparent) */
     /* Entry 1: semi-transparent black background */
     pes[p++] = 0x01; /* CLUT_entry_id = 1 */
-    pes[p++] = 0xE1; /* 2-bit + 4-bit + 8-bit CLUT flags + full_range */
+    pes[p++] = clut_flag;
     pes[p++] = 0x10; /* Y = 16 (black in BT.601) */
     pes[p++] = 0x80; /* Cr = 128 (neutral) */
     pes[p++] = 0x80; /* Cb = 128 (neutral) */
     pes[p++] = 0x80; /* T = 0x80 (semi-transparent) */
     /* Entry 2: white text (fully opaque) */
     pes[p++] = 0x02; /* CLUT_entry_id = 2 */
-    pes[p++] = 0xE1; /* 2-bit + 4-bit + 8-bit CLUT flags + full_range */
+    pes[p++] = clut_flag;
     pes[p++] = 0xEB; /* Y = 235 (white in BT.601) */
     pes[p++] = 0x80; /* Cr = 128 (neutral) */
     pes[p++] = 0x80; /* Cb = 128 (neutral) */
@@ -2167,6 +2298,10 @@ static void print_usage(const char *progname)
         "  --forced         Mark subtitle as hearing-impaired (auto-selects on some players)\n"
         "  --inject-interval N  Subtitle re-injection interval in seconds (default: 8)\n"
         "                   Lower = faster display on channel join, Higher = less overhead\n"
+        "  --dvb-2bit       Use 2-bit pixel depth for DVB subtitles (max IPTV compat)\n"
+        "                   Most lightweight IPTV decoders support 2-bit. Try this if\n"
+        "                   8-bit (default) shows black bar but no text on your player.\n"
+        "  --dvb-4bit       Use 4-bit pixel depth for DVB subtitles\n"
         "  --sdt            Modify SDT to advertise subtitle service availability\n"
         "                   Helps players discover the subtitle track on channel join\n"
         "  --cc             Inject CEA-608+708 closed captions into H.264 video stream\n"
@@ -2255,6 +2390,10 @@ int main(int argc, char *argv[])
             if (inject_interval_sec > 30) inject_interval_sec = 30;
         } else if (strcmp(argv[i], "--cc") == 0 || strcmp(argv[i], "--cc608") == 0) {
             cc_enabled = 1;
+        } else if (strcmp(argv[i], "--dvb-2bit") == 0) {
+            dvb_pixel_depth = 2;
+        } else if (strcmp(argv[i], "--dvb-4bit") == 0) {
+            dvb_pixel_depth = 4;
         } else if (strcmp(argv[i], "--sdt") == 0) {
             sdt_modify_enabled = 1;
         } else if (strcmp(argv[i], "--ab-audio") == 0) {
@@ -2341,6 +2480,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[ts_fingerprint]   CEA-708: random window positioning (anti-tamper)\n");
         fprintf(stderr, "[ts_fingerprint]   CEA-608: fixed bottom row (backwards compat)\n");
     }
+    fprintf(stderr, "[ts_fingerprint] DVB subtitle pixel depth: %d-bit\n", dvb_pixel_depth);
     if (sdt_modify_enabled) {
         fprintf(stderr, "[ts_fingerprint] SDT modification: ENABLED (subtitle service advertised)\n");
     }
