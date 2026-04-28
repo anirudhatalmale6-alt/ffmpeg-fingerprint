@@ -865,12 +865,27 @@ static int build_dvb_subtitle_pes(const char *text, int position,
         pos_y = (rand_state >> 16) % max_y;
     }
 
-    /* Render text into full-width bitmap (position baked in for MAG compat) */
+    /*
+     * In 2-bit mode: render compact text-only bitmap, position via DVB protocol
+     * fields (region_horizontal_address + object_horizontal_position). This avoids
+     * encoding huge transparent runs that break lightweight IPTV decoders (IBO).
+     *
+     * In 8-bit mode: render full-width bitmap with position baked in for MAG compat.
+     */
     int bmp_w, bmp_h;
-    uint8_t *bitmap = render_text_bitmap(text, vid_w, pos_x, font_scale, &bmp_w, &bmp_h);
+    uint8_t *bitmap;
+    int use_protocol_positioning = (dvb_pixel_depth == 2);
+
+    if (use_protocol_positioning) {
+        bitmap = render_text_bitmap(text, 0, 0, font_scale, &bmp_w, &bmp_h);
+    } else {
+        bitmap = render_text_bitmap(text, vid_w, pos_x, font_scale, &bmp_w, &bmp_h);
+    }
     if (!bitmap) return -1;
 
-    /* Clamp vertical position to display bounds */
+    /* Clamp positions to display bounds */
+    if (pos_x + bmp_w > vid_w) pos_x = vid_w - bmp_w;
+    if (pos_x < 0) pos_x = 0;
     if (pos_y + bmp_h > vid_h) pos_y = vid_h - bmp_h;
     if (pos_y < 0) pos_y = 0;
 
@@ -936,7 +951,11 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     /* Region info in PCS */
     pes[p++] = region_id; /* region_id */
     pes[p++] = 0x00; /* reserved */
-    put_be16(pes + p, 0); p += 2; /* region_horizontal_address = 0 (full-width for MAG compat) */
+    if (use_protocol_positioning) {
+        put_be16(pes + p, pos_x); p += 2; /* region_horizontal_address (protocol positioning) */
+    } else {
+        put_be16(pes + p, 0); p += 2; /* region_horizontal_address = 0 (full-width for MAG compat) */
+    }
     put_be16(pes + p, pos_y); p += 2; /* region_vertical_address */
     put_be16(pes + pcs_len_pos, p - pcs_start);
 
@@ -948,8 +967,11 @@ static int build_dvb_subtitle_pes(const char *text, int position,
     put_be16(pes + p, 0); p += 2;
     int rcs_start = p;
     pes[p++] = region_id; /* region_id */
-    pes[p++] = 0x08; /* region_version_number(4b)=0 + region_fill_flag(1b)=1 + reserved(3b)=000 */
-    put_be16(pes + p, bmp_w); p += 2; /* region_width = full display width (MAG compat) */
+    if (use_protocol_positioning)
+        pes[p++] = 0x00; /* region_version(4b)=0 + fill_flag(1b)=0 + reserved(3b)=000 (no fill for compact region) */
+    else
+        pes[p++] = 0x08; /* region_version(4b)=0 + fill_flag(1b)=1 + reserved(3b)=000 */
+    put_be16(pes + p, bmp_w); p += 2; /* region_width (compact in 2-bit, full-width in 8-bit) */
     put_be16(pes + p, bmp_h); p += 2; /* region_height */
     /*
      * region_level_of_compatibility(3b) + region_depth(3b) + reserved(2b)
