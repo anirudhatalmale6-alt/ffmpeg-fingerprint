@@ -1022,10 +1022,13 @@ static int build_dvb_subtitle_pes(const char *text, int position,
      * Data per entry: Y(8b), Cr(8b), Cb(8b), T(8b)
      * T convention: 0x00 = opaque, 0xFF = transparent (FFmpeg/DVB standard)
      */
-    uint8_t clut_flag = 0xE1; /* all tables */
-    if (dvb_pixel_depth == 2) clut_flag = 0x21;
-    else if (dvb_pixel_depth == 4) clut_flag = 0x41;
-    else if (dvb_pixel_depth == 8) clut_flag = 0x81;
+    /*
+     * Always populate ALL CLUT tables (0xE1) regardless of pixel depth.
+     * Different players read from different tables (VLC uses 8-bit, IBO uses 2-bit).
+     * If we only populate the matching table, players reading other tables get
+     * default colors (green artifacts on VLC, wrong colors on other players).
+     */
+    uint8_t clut_flag = 0xE1;
 
     /* Entry 0: fully transparent (background/unused) */
     pes[p++] = 0x00; /* CLUT_entry_id = 0 */
