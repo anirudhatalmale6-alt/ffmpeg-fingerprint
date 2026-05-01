@@ -198,6 +198,170 @@ static uint8_t subtitling_type = 0x10;
 /* DVB subtitle pixel depth: 8=8-bit (default), 2=2-bit (max IPTV compat), 4=4-bit */
 static int dvb_pixel_depth = 8;
 
+/* Flash mode: brief video replacement showing user ID on black screen */
+static int flash_enabled = 0;
+static int flash_active = 0;
+static time_t flash_start_time = 0;
+static int flash_duration_ms = 1500;      /* how long the flash shows (ms) */
+static int flash_interval_sec = 0;        /* auto-repeat interval (0=manual only) */
+static time_t flash_last_trigger = 0;
+static uint8_t *flash_ts_data = NULL;     /* cached TS packets for flash */
+static int flash_ts_count = 0;            /* number of TS packets */
+static int flash_ts_pos = 0;             /* current playback position */
+static char flash_cached_text[MAX_TEXT_LEN] = "";
+static uint16_t flash_video_pid = 0;
+static uint16_t flash_audio_pid = 0;
+static uint8_t flash_video_cc = 0;
+static uint8_t flash_audio_cc = 0;
+
+/*
+ * Generate flash video: calls FFmpeg to create a short .ts clip with
+ * text on black background. Caches the TS packets in memory.
+ */
+static int generate_flash_clip(const char *text, int width, int height,
+                                uint16_t vpid, uint16_t apid)
+{
+    /* Skip if same text is already cached */
+    if (flash_ts_data && strcmp(flash_cached_text, text) == 0 &&
+        flash_video_pid == vpid && flash_audio_pid == apid) {
+        flash_ts_pos = 0;
+        return 0;
+    }
+
+    free(flash_ts_data);
+    flash_ts_data = NULL;
+    flash_ts_count = 0;
+    flash_ts_pos = 0;
+
+    /* Random position for text */
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)getpid();
+    int text_len = strlen(text);
+    int fontsize = (height >= 1080) ? 72 : 48;
+    int text_pixel_w = text_len * fontsize / 2;
+    int max_x = width - text_pixel_w - 40;
+    int max_y = height - fontsize - 40;
+    if (max_x < 20) max_x = 20;
+    if (max_y < 20) max_y = 20;
+    int tx = 20 + (rand_r(&seed) % max_x);
+    int ty = 20 + (rand_r(&seed) % max_y);
+
+    char tmpfile[256];
+    snprintf(tmpfile, sizeof(tmpfile), "/tmp/ts_flash_%d.ts", getpid());
+
+    /* Generate flash clip: black screen with white text, silent audio */
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+        "ffmpeg -y -f lavfi -i \"color=black:size=%dx%d:rate=25:d=2\" "
+        "-f lavfi -i \"anullsrc=r=48000:cl=stereo\" "
+        "-vf \"drawtext=text='%s':fontsize=%d:fontcolor=white:"
+        "x=%d:y=%d:borderw=2:bordercolor=black\" "
+        "-c:v libx264 -preset ultrafast -tune stillimage -profile:v main "
+        "-level 4.0 -g 1 -bf 0 -crf 23 "
+        "-c:a aac -b:a 64k -ac 2 "
+        "-f mpegts -mpegts_start_pid %d "
+        "-t %.1f "
+        "\"%s\" "
+        ">/dev/null 2>/dev/null",
+        width, height, text, fontsize, tx, ty,
+        vpid, (float)flash_duration_ms / 1000.0, tmpfile);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        fprintf(stderr, "[ts_fingerprint] Flash: FFmpeg failed (ret=%d)\n", ret);
+        return -1;
+    }
+
+    /* Read the generated TS file into memory */
+    FILE *f = fopen(tmpfile, "rb");
+    if (!f) {
+        fprintf(stderr, "[ts_fingerprint] Flash: cannot open %s\n", tmpfile);
+        unlink(tmpfile);
+        return -1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (fsize < TS_PACKET_SIZE || fsize > 4 * 1024 * 1024) {
+        fprintf(stderr, "[ts_fingerprint] Flash: bad file size %ld\n", fsize);
+        fclose(f);
+        unlink(tmpfile);
+        return -1;
+    }
+
+    flash_ts_data = malloc(fsize);
+    if (!flash_ts_data) {
+        fclose(f);
+        unlink(tmpfile);
+        return -1;
+    }
+
+    int bytes_read = fread(flash_ts_data, 1, fsize, f);
+    fclose(f);
+    unlink(tmpfile);
+
+    flash_ts_count = bytes_read / TS_PACKET_SIZE;
+    flash_video_pid = vpid;
+    flash_audio_pid = apid;
+    strncpy(flash_cached_text, text, MAX_TEXT_LEN - 1);
+    flash_cached_text[MAX_TEXT_LEN - 1] = '\0';
+
+    fprintf(stderr, "[ts_fingerprint] Flash: generated %d TS packets for '%s' (%dx%d)\n",
+            flash_ts_count, text, width, height);
+    return 0;
+}
+
+/*
+ * Write the next batch of flash TS packets to stdout.
+ * Rewrites PIDs to match the live stream.
+ * Returns number of packets written, 0 if flash clip exhausted.
+ */
+static int write_flash_packets(int max_packets, uint16_t live_vpid, uint16_t live_apid)
+{
+    if (!flash_ts_data || flash_ts_pos >= flash_ts_count) return 0;
+
+    int written = 0;
+    while (written < max_packets && flash_ts_pos < flash_ts_count) {
+        uint8_t pkt[TS_PACKET_SIZE];
+        memcpy(pkt, flash_ts_data + flash_ts_pos * TS_PACKET_SIZE, TS_PACKET_SIZE);
+
+        if (pkt[0] == TS_SYNC_BYTE) {
+            uint16_t pkt_pid = ((pkt[1] & 0x1F) << 8) | pkt[2];
+
+            /* Rewrite video PID and CC to match live stream */
+            if (pkt_pid == flash_video_pid || pkt_pid == 0x100) {
+                pkt[1] = (pkt[1] & 0xE0) | ((live_vpid >> 8) & 0x1F);
+                pkt[2] = live_vpid & 0xFF;
+                pkt[3] = (pkt[3] & 0xF0) | (flash_video_cc & 0x0F);
+                flash_video_cc = (flash_video_cc + 1) & 0x0F;
+                fwrite(pkt, 1, TS_PACKET_SIZE, stdout);
+                written++;
+            }
+            /* Rewrite audio PID and CC */
+            else if (pkt_pid == flash_audio_pid || pkt_pid == 0x101) {
+                pkt[1] = (pkt[1] & 0xE0) | ((live_apid >> 8) & 0x1F);
+                pkt[2] = live_apid & 0xFF;
+                pkt[3] = (pkt[3] & 0xF0) | (flash_audio_cc & 0x0F);
+                flash_audio_cc = (flash_audio_cc + 1) & 0x0F;
+                fwrite(pkt, 1, TS_PACKET_SIZE, stdout);
+                written++;
+            }
+            /* Skip PAT/PMT from flash file (use live stream's) */
+            else if (pkt_pid == 0x0000 || pkt_pid == 0x1000 || pkt_pid == 0x0FFF) {
+                /* skip */
+            }
+            else {
+                fwrite(pkt, 1, TS_PACKET_SIZE, stdout);
+                written++;
+            }
+        }
+        flash_ts_pos++;
+    }
+
+    return written;
+}
+
 /* TTF font support */
 static uint8_t *ttf_font_data = NULL;
 static stbtt_fontinfo ttf_font_info;
@@ -2224,6 +2388,35 @@ static void *zmq_thread_func(void *arg)
             snprintf(reply, sizeof(reply), "OK ab_disabled");
             fprintf(stderr, "[ts_fingerprint] AB_AUDIO disabled\n");
 
+        } else if (strncmp(buf, "FLASH ", 6) == 0) {
+            char *flash_text = buf + 6;
+            while (*flash_text == ' ') flash_text++;
+            if (strlen(flash_text) > 0 && video_pid != 0) {
+                strncpy(g_state.text, flash_text, MAX_TEXT_LEN - 1);
+                g_state.text[MAX_TEXT_LEN - 1] = '\0';
+                flash_enabled = 1;
+                flash_active = 1;
+                flash_start_time = time(NULL);
+                flash_ts_pos = 0;
+                /* Generate clip in background - will happen on next main loop iteration */
+                if (generate_flash_clip(flash_text, display_width, display_height,
+                                        video_pid, audio_pid) == 0) {
+                    snprintf(reply, sizeof(reply), "OK flash_started text=%s", flash_text);
+                } else {
+                    flash_active = 0;
+                    snprintf(reply, sizeof(reply), "ERR flash_generation_failed");
+                }
+                fprintf(stderr, "[ts_fingerprint] FLASH '%s'\n", flash_text);
+            } else {
+                snprintf(reply, sizeof(reply), "ERR flash requires text and video_pid");
+            }
+
+        } else if (strcmp(buf, "FLASH_STOP") == 0) {
+            flash_active = 0;
+            flash_ts_pos = 0;
+            snprintf(reply, sizeof(reply), "OK flash_stopped");
+            fprintf(stderr, "[ts_fingerprint] FLASH stopped\n");
+
         } else {
             snprintf(reply, sizeof(reply), "ERR unknown command");
         }
@@ -2360,6 +2553,12 @@ static void print_usage(const char *progname)
         "                   Auto-displays on ExoPlayer apps (iboPlayer, TiviMate, etc.)\n"
         "                   Zero re-encoding - injects SEI NAL units into existing video\n"
         "\n"
+        "Flash Mode (video replacement):\n"
+        "  --flash-duration N   Flash display time in milliseconds (default: 1500)\n"
+        "  --flash-interval N   Auto-repeat flash every N seconds (0=manual only, default: 0)\n"
+        "                       Triggered via ZMQ: FLASH <text>\n"
+        "                       Works on ALL players - replaces video stream briefly\n"
+        "\n"
         "A/B Audio Watermark Options:\n"
         "  --ab-audio       Enable A/B audio watermark selection\n"
         "                   Requires input stream with 2 audio PIDs (variant A and B)\n"
@@ -2378,6 +2577,8 @@ static void print_usage(const char *progname)
         "  STATUS               Get fingerprint state\n"
         "  STATS                Get real-time stream statistics (text format)\n"
         "  STATS_JSON           Get real-time stream statistics (JSON format)\n"
+        "  FLASH <text>         Flash user ID on black screen (works on ALL players)\n"
+        "  FLASH_STOP          Stop active flash\n"
         "  LANG <code>          Set subtitle language (e.g. LANG tur)\n"
         "  AB_PATTERN <bits>    Set A/B audio pattern (e.g. 01101001001011)\n"
         "  AB_STATUS            Get A/B audio watermark state\n"
@@ -2464,6 +2665,14 @@ int main(int argc, char *argv[])
             ab_audio_segment_duration = atoi(argv[++i]);
             if (ab_audio_segment_duration < 1) ab_audio_segment_duration = 1;
             if (ab_audio_segment_duration > 30) ab_audio_segment_duration = 30;
+        } else if (strcmp(argv[i], "--flash-duration") == 0 && i + 1 < argc) {
+            flash_duration_ms = atoi(argv[++i]);
+            if (flash_duration_ms < 500) flash_duration_ms = 500;
+            if (flash_duration_ms > 5000) flash_duration_ms = 5000;
+        } else if (strcmp(argv[i], "--flash-interval") == 0 && i + 1 < argc) {
+            flash_interval_sec = atoi(argv[++i]);
+            if (flash_interval_sec < 0) flash_interval_sec = 0;
+            flash_enabled = 1;
         } else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) {
             stats_stderr_interval = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -2753,6 +2962,40 @@ int main(int argc, char *argv[])
             continue;
         }
 
+        /* Flash mode: replace live video/audio with flash clip */
+        if (flash_active && flash_ts_data) {
+            time_t now_flash = time(NULL);
+            double elapsed_sec = difftime(now_flash, flash_start_time);
+
+            if (elapsed_sec * 1000 >= flash_duration_ms || flash_ts_pos >= flash_ts_count) {
+                flash_active = 0;
+                flash_ts_pos = 0;
+                flash_last_trigger = now_flash;
+                fprintf(stderr, "[ts_fingerprint] Flash: completed\n");
+            } else if (pid == video_pid || pid == audio_pid) {
+                /* Drop live video/audio, send flash packets instead */
+                flash_video_cc = ts_packet[3] & 0x0F;
+                write_flash_packets(3, video_pid, audio_pid);
+                packet_count++;
+                continue;
+            }
+        }
+
+        /* Flash auto-repeat */
+        if (flash_interval_sec > 0 && !flash_active && flash_ts_data &&
+            g_state.active && g_state.text[0] != '\0') {
+            time_t now_fr = time(NULL);
+            if (flash_last_trigger == 0 ||
+                difftime(now_fr, flash_last_trigger) >= flash_interval_sec) {
+                flash_active = 1;
+                flash_start_time = now_fr;
+                flash_ts_pos = 0;
+                generate_flash_clip(g_state.text, display_width, display_height,
+                                    video_pid, audio_pid);
+                fprintf(stderr, "[ts_fingerprint] Flash: auto-repeat triggered\n");
+            }
+        }
+
         /* Write the current packet (PUSI first, before any overflow) */
         fwrite(ts_packet, 1, TS_PACKET_SIZE, stdout);
         packet_count++;
@@ -2807,6 +3050,7 @@ done:
     pthread_mutex_destroy(&g_state.mutex);
     pthread_mutex_destroy(&g_stats.mutex);
     if (ttf_font_data && ttf_font_is_external) free(ttf_font_data);
+    free(flash_ts_data);
 
     return 0;
 }
