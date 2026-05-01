@@ -201,6 +201,7 @@ static int dvb_pixel_depth = 8;
 /* Flash mode: brief video replacement showing user ID on black screen */
 static int flash_enabled = 0;
 static int flash_active = 0;
+static int flash_recovering = 0;  /* waiting for keyframe after flash ends */
 static time_t flash_start_time = 0;
 static int flash_duration_ms = 1500;      /* how long the flash shows (ms) */
 static int flash_interval_sec = 0;        /* auto-repeat interval (0=manual only) */
@@ -2413,6 +2414,7 @@ static void *zmq_thread_func(void *arg)
 
         } else if (strcmp(buf, "FLASH_STOP") == 0) {
             flash_active = 0;
+            flash_recovering = 0;
             flash_ts_pos = 0;
             snprintf(reply, sizeof(reply), "OK flash_stopped");
             fprintf(stderr, "[ts_fingerprint] FLASH stopped\n");
@@ -2969,9 +2971,10 @@ int main(int argc, char *argv[])
 
             if (elapsed_sec * 1000 >= flash_duration_ms || flash_ts_pos >= flash_ts_count) {
                 flash_active = 0;
+                flash_recovering = 1;
                 flash_ts_pos = 0;
                 flash_last_trigger = now_flash;
-                fprintf(stderr, "[ts_fingerprint] Flash: completed\n");
+                fprintf(stderr, "[ts_fingerprint] Flash: completed, waiting for keyframe to resume\n");
             } else if (pid == video_pid || pid == audio_pid) {
                 /* Drop live video/audio, send flash packets instead */
                 flash_video_cc = ts_packet[3] & 0x0F;
@@ -2979,6 +2982,22 @@ int main(int argc, char *argv[])
                 packet_count++;
                 continue;
             }
+        }
+
+        /* Flash recovery: drop video/audio until next keyframe for clean resync */
+        if (flash_recovering && !flash_active) {
+            if (pid == video_pid) {
+                if (ts_has_random_access(ts_packet)) {
+                    flash_recovering = 0;
+                    fprintf(stderr, "[ts_fingerprint] Flash: keyframe found, stream resumed\n");
+                    /* Fall through to normal processing - this keyframe packet gets written */
+                } else {
+                    continue; /* drop non-keyframe video packets */
+                }
+            } else if (pid == audio_pid) {
+                continue; /* drop audio until video keyframe arrives */
+            }
+            /* PAT/PMT/SDT/other PIDs pass through during recovery */
         }
 
         /* Flash auto-repeat */
