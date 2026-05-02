@@ -83,14 +83,31 @@ Fingerprint Options:
   --text TEXT       Initial fingerprint text (show immediately)
   --position N     Position 0-8 (-1=random, default=-1)
   --lang CODE      Subtitle language code (default: eng)
+  --auto-lang      Auto-match subtitle language to audio language from stream PMT
   --display WxH    Display resolution (default: 1920x1080)
                    720x576 for SD, 1920x1080 for HD, 3840x2160 for 4K
   --fontscale N    Font scale factor 1-4 (default: auto based on display)
   --forced         Mark subtitle as hearing-impaired (auto-selects on some players)
+  --dvb-2bit       Use 2-bit DVB subtitle pixel depth (best IPTV player compatibility)
+  --dvb-4bit       Use 4-bit DVB subtitle pixel depth
   --cc             Inject CEA-608+708 closed captions into H.264 video stream
                    CEA-708: random window positioning (anti-tamper)
                    CEA-608: fixed bottom row (backwards compatibility)
                    Auto-displays on ExoPlayer IPTV apps (iboPlayer, TiviMate, etc.)
+  --sdt            Modify SDT to advertise subtitle service to players
+  --flash          Enable flash mode (brief black screen with user ID)
+                   Works on ALL players - replaces video stream momentarily
+  --flash-duration N   Flash display duration in ms (default: 1500)
+  --flash-interval N   Auto-repeat interval in seconds (0=manual only)
+
+Audio Watermark Options:
+  --audio-watermark    Enable A/B audio watermark (works in all modes)
+                       Generates 2 audio tracks with different inaudible tones
+                       In DVB mode: video passthrough, audio-only re-encode
+  --ab-pattern PAT     Binary pattern for A/B selection (e.g. 01101001)
+  --ab-segment-duration N  Seconds per A/B segment (default: 4)
+  --tone-a HZ          Frequency for tone A (default: 18500)
+  --tone-b HZ          Frequency for tone B (default: 19500)
 
 Stream Statistics (built-in ffprobe replacement):
   --stats N        Print stream stats to stderr every N seconds (0=off)
@@ -199,6 +216,11 @@ can place a static overlay to block that position. Random is always better.
 | `SHOW text` | `OK` | Show fingerprint with random position |
 | `SHOW text 3` | `OK` | Show at specific position (0-8) |
 | `HIDE` | `OK` | Hide fingerprint |
+| `FLASH text` | `OK flash_started` | Flash user ID on black screen (all players) |
+| `FLASH_STOP` | `OK flash_stopped` | Stop active flash |
+| `AB_PATTERN 01101001` | `OK ab_pattern_len=8` | Set A/B audio watermark pattern |
+| `AB_STATUS` | `enabled=1 len=8...` | Get A/B audio watermark state |
+| `AB_DISABLE` | `OK` | Disable A/B audio watermark |
 | `STATUS` | `active=1 text=USER pos=-1` | Get fingerprint state |
 | `STATS` | `uptime=1h23m... video_codec=H.264...` | Stream stats (text) |
 | `STATS_JSON` | `{"uptime_seconds":...}` | Stream stats (JSON) |
@@ -440,6 +462,169 @@ Recommended approach:
 Burn-in mode automatically uses the bundled `fonts/dash.ttf` font.
 Override with `--font /path/to/custom.ttf`.
 The DVB subtitle mode uses the embedded font (compiled into the binary).
+
+---
+
+## DVB 2-Bit Pixel Depth (IBO Player / IPTV App Compatibility)
+
+Standard 8-bit DVB subtitles don't render on many IPTV apps (IBO Player, Set IPTV, etc.).
+The `--dvb-2bit` flag uses 2-bit pixel depth which is the only format that works reliably
+on these lightweight decoders.
+
+### Usage
+
+```bash
+# DVB 2-bit for IPTV apps (IBO Player, Set IPTV, etc.)
+ffmpeg -i "SOURCE" -c:v copy -c:a copy -f mpegts pipe:1 | \
+  ./bin/ts_fingerprint --dvb-2bit --forced --lang eng --zmq tcp://127.0.0.1:5556
+
+# With the wrapper script
+./ffmpeg_fingerprint.sh -i "SOURCE" --dvb-2bit --forced --lang eng \
+  --zmq tcp://127.0.0.1:5555 -f mpegts pipe:1
+```
+
+### Why 2-bit
+
+- 8-bit and 4-bit DVB subtitles do NOT render on IBO Player and similar IPTV apps
+- 2-bit uses minimal CLUT entries (4 colors) which lightweight decoders handle correctly
+- All CLUT tables (2-bit, 4-bit, 8-bit) are populated for cross-player compatibility
+- Works on VLC, MAG, Enigma2, IBO Player, and Set IPTV
+
+### Auto-Language Matching
+
+The `--auto-lang` flag reads the audio language from PMT descriptors and sets the
+subtitle language to match. Helps with auto-selection on players that prefer matching
+subtitle/audio languages.
+
+```bash
+./bin/ts_fingerprint --dvb-2bit --auto-lang --forced
+```
+
+---
+
+## Flash Mode (Works on ALL Players)
+
+Flash mode briefly replaces the live video stream with a black screen showing the
+user ID text. Since it IS the video stream (not a subtitle overlay), it works on
+every single player regardless of subtitle support.
+
+### How It Works
+
+1. FFmpeg generates a short clip (1.5s default): black background + white text + silent audio
+2. ts_fingerprint replaces live video/audio packets with the flash clip
+3. Video/audio PIDs are rewritten to match the live stream
+4. After flash ends, recovery waits for next keyframe before resuming live stream
+5. Keyframe-wait recovery prevents audio desync glitches
+
+### Usage
+
+```bash
+# Enable flash mode via CLI
+./bin/ts_fingerprint --flash --zmq tcp://127.0.0.1:5556
+
+# Trigger via ZMQ
+FLASH username_12345
+
+# Stop flash early
+FLASH_STOP
+
+# Auto-repeat every 60 seconds
+./bin/ts_fingerprint --flash --flash-interval 60 --zmq tcp://127.0.0.1:5556
+```
+
+### Flash + DVB Subtitle Combined
+
+You can use flash mode together with DVB subtitles. DVB subtitles show continuously,
+flash mode triggers periodically for extra visibility:
+
+```bash
+./bin/ts_fingerprint --dvb-2bit --forced --flash --flash-interval 120 \
+  --zmq tcp://127.0.0.1:5556
+```
+
+### Resource Usage
+
+- Flash clip generation: one-time FFmpeg call per unique text (cached in memory)
+- During flash: zero extra CPU (just packet replacement)
+- Recovery: drops 0-2 seconds of live video while waiting for next keyframe
+
+---
+
+## A/B Audio Watermark (Inaudible, Works With Single Audio Track)
+
+Embeds an inaudible per-user audio pattern using ultrasonic tones (18.5kHz / 19.5kHz).
+Each user gets a unique binary pattern of A/B audio segments that can identify them
+from a recording.
+
+### Architecture
+
+```
+Source (1 audio track)
+  |
+  v
+FFmpeg (1 per CHANNEL) -- creates 2 audio tracks:
+  Track A: original audio + 18.5kHz tone
+  Track B: original audio + 19.5kHz tone
+  Video: passthrough copy (no re-encoding)
+  |
+  v
+ts_fingerprint (1 per USER) -- lightweight A/B switching:
+  Selects track A or B per 4-second segment
+  Based on per-user binary pattern (e.g. 01101001)
+  Output has single audio PID (PID rewrite for seamless playback)
+```
+
+No per-user encoding. Audio AAC encode is ~1-2% CPU per channel.
+
+### Usage
+
+```bash
+# DVB subtitle + audio watermark (recommended combo)
+./ffmpeg_fingerprint.sh -i "udp://239.1.1.1:1234" \
+  --audio-watermark --dvb-2bit --forced \
+  --zmq tcp://127.0.0.1:5555 \
+  -f mpegts pipe:1
+
+# Audio watermark only (no visible fingerprint)
+./ffmpeg_fingerprint.sh -i "udp://239.1.1.1:1234" \
+  --audio-watermark --ab-pattern 01101001 \
+  --zmq tcp://127.0.0.1:5555 \
+  -f mpegts pipe:1
+
+# Set pattern via ZMQ (per-user)
+AB_PATTERN 01101001001011
+
+# Check status
+AB_STATUS
+
+# Disable
+AB_DISABLE
+```
+
+### Pattern Generation
+
+Each user needs a unique binary pattern. Use the included generator:
+
+```bash
+python3 audio/generate_pattern.py --user-id 12345 --bits 14
+# Output: 01101001001011
+```
+
+### Detection
+
+Upload a recording to detect which user leaked the stream:
+
+```bash
+# CLI detection
+python3 audio/detect.py recording.mp4
+
+# Web GUI (Flask)
+cd audio/web && python3 app.py
+# Open http://localhost:5000 - upload recording, get user match
+```
+
+The detector uses FFT analysis to identify the A/B tone pattern in each segment,
+then matches against known user patterns.
 
 ---
 
@@ -752,48 +937,46 @@ make clean
 
 ## Full Pipeline Example (Xtream Codes)
 
+### DVB Subtitle Mode (zero CPU, no audio watermark)
+
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│ Source Provider                                                       │
-│ http://provider.com/live/channel1                                    │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           │
-                    ┌──────▼���─────┐
-                    │   FFmpeg    │  -c:v copy -c:a copy (zero CPU)
-                    │ (no encode) │
-                    └──────┬──────┘
-                           │ pipe (MPEG-TS)
-                    ┌──────▼──────────────┐
-                    │  ts_fingerprint     │  DVB subtitle injection
-                    │  --zmq :5556        │  + real-time stream stats
-                    │  --forced --lang eng│
-                    └──────┬──────────────┘
-                           │ pipe (MPEG-TS + subtitles)
-                    ┌──────▼──────┐
-                    │   Output    │  HLS / RTMP / MPEG-TS / ...
-                    │  (FFmpeg)   │  -disposition:s:0 default
-                    └──────┬──────┘
-                           │
-              ┌────────────┼────────────┐
-              │            │            │
-         ┌────▼────┐ ┌─���──▼────┐ ┌────▼────┐
-         │  VLC    │ │  MAG    │ │ Enigma2 │
-         │ (auto)  │ │ (auto)  │ │ (native)│
-         └───���─────┘ └─────────┘ └─────────┘
+Source --> FFmpeg (video+audio copy) --> ts_fingerprint --> Output
+          No re-encoding                DVB subtitle + flash
 ```
+
+### DVB Subtitle + Audio Watermark (recommended for leaker detection)
+
+```
+Source --> FFmpeg (1 per CHANNEL)        --> ts_fingerprint (1 per USER)  --> Output
+          video: copy (passthrough)         DVB 2-bit subtitle injection
+          audio: re-encode to 2 tracks      A/B audio switching per user
+          (A=18.5kHz, B=19.5kHz)            Flash mode (on demand)
+          ~1-2% CPU per channel             ~5-10MB RAM, <1% CPU per user
+```
+
+### Burn-In Mode (for raw .ts or guaranteed visibility)
+
+```
+Source --> FFmpeg (1 per CHANNEL)        --> ts_fingerprint (1 per USER)  --> Output
+          video: re-encode with text        A/B audio switching
+          audio: 2 tracks with tones        (optional DVB subtitle too)
+          High CPU per channel
+```
+
 
 ---
 
 ## Troubleshooting
 
 ### Fingerprint not visible
-1. Check subtitles are enabled in player
+1. Use `--dvb-2bit` for IPTV apps (IBO Player, Set IPTV) - 8-bit does NOT work
 2. Try `--forced --lang eng` flags
-3. For IPTV apps (iboPlayer, TiviMate): add `--cc` flag
+3. For IPTV apps: add `--cc` flag (CEA-608+708 captions)
 4. For VLC: add `-disposition:s:0 default` to output FFmpeg
 5. For MAG: set portal subtitle language to match --lang
 6. Run `./bin/ts_fingerprint --stats 5` to verify stream is flowing
 7. For raw .ts or stubborn players: use `--burn-in` or `--dual` mode
+8. Use flash mode (`FLASH username`) - works on ALL players regardless of settings
 
 ### Black bar when no fingerprint
 This was fixed - subtitle PID only added to PMT after first SHOW command.
@@ -815,3 +998,14 @@ Set the subtitle language to match your --lang setting.
 Use `--burn-preset ultrafast` (default) for lowest CPU.
 Increase `--burn-crf` (e.g. 28) for lower quality but faster encoding.
 Consider DVB subtitle mode for most channels, burn-in only where needed.
+
+### Audio desync after flash mode
+Flash recovery automatically waits for the next keyframe before resuming
+the live stream. If you still hear glitches, increase `--flash-duration`
+to ensure the flash clip fully plays before recovery kicks in.
+
+### Audio watermark not detected
+1. Make sure the source channel has audio (check with `STATS` command)
+2. Verify 2 audio PIDs are detected: look for "Found audio PID B" in stderr
+3. Recording must be at least 30 seconds for reliable pattern matching
+4. Source audio sample rate should be 48000Hz for best ultrasonic tone detection
