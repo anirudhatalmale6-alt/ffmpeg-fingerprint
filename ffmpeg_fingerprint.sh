@@ -143,9 +143,10 @@ Fingerprint Options:
                    Text in video frames AND subtitle track for all players/devices
   --burn-preset P  x264 preset for burn-in mode (default: ultrafast)
   --burn-crf N     x264 CRF quality for burn-in mode (default: 23, lower=better)
-  --audio-watermark  Enable A/B audio watermark (use with --burn-in)
+  --audio-watermark  Enable A/B audio watermark (works in all modes)
                    Generates 2 audio tracks with different inaudible tones
                    ts_fingerprint selects A or B per segment per user
+                   In DVB mode: video passthrough, audio-only re-encode (very lightweight)
   --ab-pattern PAT Binary pattern for A/B selection (e.g. 01101001001011)
   --ab-segment-duration N  Seconds per A/B segment (default: 4)
   --tone-a HZ      Frequency for tone A (default: 18500)
@@ -457,7 +458,16 @@ if [ ${#FFMPEG_EXTRA_ARGS[@]} -gt 0 ]; then
 fi
 
 FFMPEG_CMD+=(-i "$INPUT")
-FFMPEG_CMD+=(-c:v copy -c:a copy)
+
+if [ "$FP_AUDIO_WM" -eq 1 ] && [ "$FP_BURN_IN" -eq 0 ]; then
+    FFMPEG_CMD+=(-filter_complex
+        "[0:a]asplit=2[a1][a2];sine=frequency=${FP_TONE_A}:sample_rate=48000[ta];sine=frequency=${FP_TONE_B}:sample_rate=48000[tb];[a1][ta]amix=inputs=2:weights=1 ${FP_TONE_VOLUME}[outa];[a2][tb]amix=inputs=2:weights=1 ${FP_TONE_VOLUME}[outb]")
+    FFMPEG_CMD+=(-map 0:v -map "[outa]" -map "[outb]")
+    FFMPEG_CMD+=(-c:v copy -c:a aac -b:a 128k)
+else
+    FFMPEG_CMD+=(-c:v copy -c:a copy)
+fi
+
 FFMPEG_CMD+=(-f mpegts pipe:1)
 
 # ---- Build output FFmpeg command (if needed) ----
@@ -510,7 +520,11 @@ elif [ "$FP_BURN_IN" -eq 1 ]; then
     echo "[ffmpeg_fingerprint]   Mode: BURN-IN (text in video, uses CPU)" >&2
     echo "[ffmpeg_fingerprint]   Preset: $FP_BURN_PRESET  CRF: $FP_BURN_CRF" >&2
 else
-    echo "[ffmpeg_fingerprint]   Mode: DVB subtitle (zero CPU)" >&2
+    if [ "$FP_AUDIO_WM" -eq 1 ]; then
+        echo "[ffmpeg_fingerprint]   Mode: DVB subtitle + audio watermark (video passthrough, audio re-encode)" >&2
+    else
+        echo "[ffmpeg_fingerprint]   Mode: DVB subtitle (zero CPU)" >&2
+    fi
 fi
 if [ "$FP_AUDIO_WM" -eq 1 ]; then
     echo "[ffmpeg_fingerprint]   Audio watermark: A/B tone selection (${FP_TONE_A}Hz / ${FP_TONE_B}Hz)" >&2
