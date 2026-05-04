@@ -35,8 +35,8 @@ UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp/watermark_uploads')
 USERS_FILE = os.environ.get('USERS_FILE', '')
 TONE_A_HZ = float(os.environ.get('TONE_A_HZ', '18500'))
 TONE_B_HZ = float(os.environ.get('TONE_B_HZ', '19500'))
-SEGMENT_DURATION = float(os.environ.get('SEGMENT_DURATION', '4.0'))
-NUM_BITS = int(os.environ.get('NUM_BITS', '20'))
+SEGMENT_DURATION = float(os.environ.get('SEGMENT_DURATION', '2.0'))
+NUM_BITS = int(os.environ.get('NUM_BITS', '32'))
 SAMPLE_RATE = 48000
 DETECTION_BANDWIDTH = 200
 MAX_UPLOAD_MB = 500
@@ -171,6 +171,20 @@ def analyze_file(filepath):
     matches = []
     num_bits = len(pattern_bits)
 
+    from math import comb
+    def compute_min_threshold(valid_bits, pat_len):
+        num_offsets = pat_len
+        if valid_bits < 8:
+            return 100.0
+        for tb in range(valid_bits, valid_bits // 2, -1):
+            p_single = sum(comb(valid_bits, k) for k in range(tb, valid_bits + 1)) / (2 ** valid_bits)
+            p_any = 1.0 - (1.0 - p_single) ** num_offsets
+            if p_any <= 0.01:
+                return round(tb / valid_bits * 100, 1)
+        return 100.0
+
+    min_threshold = compute_min_threshold(detected_count, num_bits)
+
     for username in users:
         expected = user_to_pattern(username, num_bits)
         best_user_score = -1
@@ -201,13 +215,14 @@ def analyze_file(filepath):
                 'score': round(best_user_score * 100, 1),
                 'matched_bits': best_user_matched,
                 'total_bits': best_user_total,
-                'offset': best_offset
+                'offset': best_offset,
+                'reliable': best_user_score * 100 >= min_threshold
             })
 
     matches.sort(key=lambda x: x['score'], reverse=True)
 
     best_match = None
-    if matches and matches[0]['score'] >= 70.0:
+    if matches and matches[0]['score'] >= min_threshold:
         best_match = matches[0]
 
     return {
@@ -221,7 +236,8 @@ def analyze_file(filepath):
         'matches': matches[:20],
         'best_match': best_match,
         'users_checked': len(users),
-        'watermark_detected': detected_count > 0
+        'watermark_detected': detected_count > 0,
+        'min_threshold': min_threshold
     }
 
 
@@ -413,17 +429,17 @@ function showResult(data) {
     document.getElementById('result').style.display = 'block';
 
     const matchBox = document.getElementById('matchBox');
-    if (data.best_match && data.best_match.score >= 80) {
+    const minThresh = data.min_threshold || 85;
+    if (data.best_match && data.best_match.score >= minThresh) {
         matchBox.innerHTML = '<div class="match-box match-found">' +
             '<div class="match-name">' + escHtml(data.best_match.username) + '</div>' +
             '<div class="match-score">Confidence: ' + data.best_match.score + '% (' +
             data.best_match.matched_bits + '/' + data.best_match.total_bits + ' bits matched, offset: ' +
-            data.best_match.offset + ' segments)</div></div>';
-    } else if (data.best_match && data.best_match.score >= 70) {
+            data.best_match.offset + ' segments, threshold: ' + minThresh + '%)</div></div>';
+    } else if (data.matches && data.matches.length > 0 && data.matches[0].score >= 50) {
         matchBox.innerHTML = '<div class="match-box match-partial">' +
-            '<div class="match-name">Possible: ' + escHtml(data.best_match.username) + '</div>' +
-            '<div class="match-score">Moderate confidence: ' + data.best_match.score + '% - recording may be degraded (offset: ' +
-            data.best_match.offset + ' segments)</div></div>';
+            '<div class="match-name">UNRELIABLE: ' + escHtml(data.matches[0].username) + ' (' + data.matches[0].score + '%)</div>' +
+            '<div class="match-score">Score below statistical threshold (' + minThresh + '%). Recording too short — need more segments for reliable detection. Try a longer recording (at least ' + (data.total_bits * {{ seg_dur }}) + 's).</div></div>';
     } else if (!data.watermark_detected) {
         matchBox.innerHTML = '<div class="match-box match-none">' +
             '<div class="match-name">No watermark detected</div>' +

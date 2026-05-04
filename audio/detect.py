@@ -34,9 +34,9 @@ except ImportError:
 
 TONE_A_HZ = 18500
 TONE_B_HZ = 19500
-SEGMENT_DURATION = 4.0
+SEGMENT_DURATION = 2.0
 SAMPLE_RATE = 48000
-NUM_BITS = 20
+NUM_BITS = 32
 DETECTION_BANDWIDTH = 200
 
 
@@ -191,7 +191,25 @@ def user_to_pattern(username, num_bits=NUM_BITS):
     return bits
 
 
-def match_user(detected_pattern, users_file=None, users_list=None, min_confidence=70.0):
+def compute_min_threshold(detected_bits, pattern_len, target_fp_rate=0.01):
+    """Compute minimum match threshold to keep false positive rate below target.
+
+    With offset search, we try pattern_len offsets per user. More offsets = higher
+    chance of random match. This adjusts the threshold accordingly.
+    """
+    from math import comb, log, ceil
+    num_offsets = pattern_len
+    if detected_bits < 8:
+        return 1.0
+    for threshold_bits in range(detected_bits, detected_bits // 2, -1):
+        p_single = sum(comb(detected_bits, k) for k in range(threshold_bits, detected_bits + 1)) / (2 ** detected_bits)
+        p_any_offset = 1.0 - (1.0 - p_single) ** num_offsets
+        if p_any_offset <= target_fp_rate:
+            return threshold_bits / detected_bits
+    return 1.0
+
+
+def match_user(detected_pattern, users_file=None, users_list=None, min_confidence=None):
     """Match detected pattern against user database using circular offset search."""
     users = []
 
@@ -208,6 +226,14 @@ def match_user(detected_pattern, users_file=None, users_list=None, min_confidenc
         return None
 
     num_bits = len(detected_pattern)
+    valid_bits = sum(1 for b in detected_pattern if b >= 0)
+
+    if min_confidence is None:
+        min_threshold = compute_min_threshold(valid_bits, num_bits)
+        min_confidence = min_threshold * 100
+    else:
+        min_confidence = float(min_confidence)
+
     best_match = None
     best_score = -1
     best_offset = 0
@@ -236,9 +262,19 @@ def match_user(detected_pattern, users_file=None, users_list=None, min_confidenc
         return {
             'username': best_match,
             'confidence': round(best_score * 100, 1),
-            'offset': best_offset
+            'offset': best_offset,
+            'min_threshold': round(min_confidence, 1),
+            'detected_bits': valid_bits
         }
-    return None
+
+    return {
+        'username': best_match,
+        'confidence': round(best_score * 100, 1) if best_score > 0 else 0,
+        'offset': best_offset,
+        'min_threshold': round(min_confidence, 1),
+        'detected_bits': valid_bits,
+        'reliable': False
+    } if best_match else None
 
 
 def main():
@@ -291,10 +327,14 @@ def main():
     match = None
     if args.users:
         match = match_user(pattern, users_file=args.users)
-        if match:
+        if match and match.get('reliable', True):
             print(f"\nMATCH FOUND: {match['username']} (confidence: {match['confidence']}%, offset: {match['offset']} segments)")
+            print(f"  Min threshold: {match['min_threshold']}% (for {match['detected_bits']} detected bits)")
+        elif match:
+            print(f"\nUNRELIABLE: Best candidate {match['username']} at {match['confidence']}% (offset {match['offset']})")
+            print(f"  Required: {match['min_threshold']}% — need longer recording ({match['detected_bits']} bits too few)")
         else:
-            print("\nNo match found (no user exceeded 70% confidence)")
+            print("\nNo match found")
 
     if args.json:
         output = {

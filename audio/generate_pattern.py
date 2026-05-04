@@ -16,7 +16,7 @@ import sys
 import argparse
 
 
-def user_to_pattern(username, num_bits=20):
+def user_to_pattern(username, num_bits=32):
     """Generate deterministic binary pattern from username/MAC using SHA-256."""
     h = hashlib.sha256(username.encode('utf-8')).digest()
     bits = []
@@ -33,8 +33,8 @@ def user_to_pattern(username, num_bits=20):
 def main():
     parser = argparse.ArgumentParser(description='Generate A/B watermark pattern')
     parser.add_argument('username', help='Username or MAC address')
-    parser.add_argument('--bits', type=int, default=20,
-                        help='Number of bits in pattern (default: 20)')
+    parser.add_argument('--bits', type=int, default=32,
+                        help='Number of bits in pattern (default: 32)')
 
     args = parser.parse_args()
     pattern = user_to_pattern(args.username, args.bits)

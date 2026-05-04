@@ -1748,7 +1748,7 @@ static int sdt_parsed = 0;
 
 /* A/B audio watermark state */
 static int ab_audio_enabled = 0;
-static int ab_audio_segment_duration = 4;  /* seconds per A/B segment */
+static int ab_audio_segment_duration = 2;  /* seconds per A/B segment */
 static uint8_t ab_audio_pattern[256];      /* binary pattern bits */
 static int ab_audio_pattern_len = 0;
 static int ab_audio_segment_idx = 0;
