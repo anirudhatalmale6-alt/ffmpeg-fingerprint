@@ -169,26 +169,46 @@ def analyze_file(filepath):
 
     users = load_users()
     matches = []
+    num_bits = len(pattern_bits)
 
     for username in users:
-        expected = user_to_pattern(username, len(pattern_bits))
-        match_count = 0
-        total = 0
-        for d, e in zip(pattern_bits, expected):
-            if d >= 0:
-                total += 1
-                if d == e:
-                    match_count += 1
-        if total > 0:
-            score = match_count / total
+        expected = user_to_pattern(username, num_bits)
+        best_user_score = -1
+        best_user_matched = 0
+        best_user_total = 0
+        best_offset = 0
+
+        for offset in range(num_bits):
+            match_count = 0
+            total = 0
+            for i, d in enumerate(pattern_bits):
+                if d >= 0:
+                    total += 1
+                    e = expected[(i + offset) % num_bits]
+                    if d == e:
+                        match_count += 1
+            if total > 0:
+                score = match_count / total
+                if score > best_user_score:
+                    best_user_score = score
+                    best_user_matched = match_count
+                    best_user_total = total
+                    best_offset = offset
+
+        if best_user_total > 0:
             matches.append({
                 'username': username,
-                'score': round(score * 100, 1),
-                'matched_bits': match_count,
-                'total_bits': total
+                'score': round(best_user_score * 100, 1),
+                'matched_bits': best_user_matched,
+                'total_bits': best_user_total,
+                'offset': best_offset
             })
 
     matches.sort(key=lambda x: x['score'], reverse=True)
+
+    best_match = None
+    if matches and matches[0]['score'] >= 70.0:
+        best_match = matches[0]
 
     return {
         'duration': round(duration, 1),
@@ -199,7 +219,7 @@ def analyze_file(filepath):
         'total_bits': len(pattern_bits),
         'segments': segments,
         'matches': matches[:20],
-        'best_match': matches[0] if matches else None,
+        'best_match': best_match,
         'users_checked': len(users),
         'watermark_detected': detected_count > 0
     }
@@ -397,11 +417,13 @@ function showResult(data) {
         matchBox.innerHTML = '<div class="match-box match-found">' +
             '<div class="match-name">' + escHtml(data.best_match.username) + '</div>' +
             '<div class="match-score">Confidence: ' + data.best_match.score + '% (' +
-            data.best_match.matched_bits + '/' + data.best_match.total_bits + ' bits matched)</div></div>';
-    } else if (data.best_match && data.best_match.score >= 50) {
+            data.best_match.matched_bits + '/' + data.best_match.total_bits + ' bits matched, offset: ' +
+            data.best_match.offset + ' segments)</div></div>';
+    } else if (data.best_match && data.best_match.score >= 70) {
         matchBox.innerHTML = '<div class="match-box match-partial">' +
             '<div class="match-name">Possible: ' + escHtml(data.best_match.username) + '</div>' +
-            '<div class="match-score">Low confidence: ' + data.best_match.score + '% - recording may be degraded</div></div>';
+            '<div class="match-score">Moderate confidence: ' + data.best_match.score + '% - recording may be degraded (offset: ' +
+            data.best_match.offset + ' segments)</div></div>';
     } else if (!data.watermark_detected) {
         matchBox.innerHTML = '<div class="match-box match-none">' +
             '<div class="match-name">No watermark detected</div>' +
@@ -436,12 +458,12 @@ function showResult(data) {
     // Matches table
     const matchTab = document.getElementById('tab-matches');
     if (data.matches.length > 0) {
-        let html = '<table><thead><tr><th>Rank</th><th>Username / MAC</th><th>Score</th><th>Bits</th></tr></thead><tbody>';
+        let html = '<table><thead><tr><th>Rank</th><th>Username / MAC</th><th>Score</th><th>Bits</th><th>Offset</th></tr></thead><tbody>';
         data.matches.forEach((m, i) => {
-            const cls = m.score >= 80 ? 'score-high' : m.score >= 50 ? 'score-mid' : 'score-low';
+            const cls = m.score >= 80 ? 'score-high' : m.score >= 70 ? 'score-mid' : 'score-low';
             html += '<tr><td>#' + (i+1) + '</td><td><strong>' + escHtml(m.username) + '</strong></td>' +
                 '<td><div class="score-bar"><div class="score-fill ' + cls + '" style="width:' + m.score + '%"></div></div>' +
-                m.score + '%</td><td>' + m.matched_bits + '/' + m.total_bits + '</td></tr>';
+                m.score + '%</td><td>' + m.matched_bits + '/' + m.total_bits + '</td><td>' + m.offset + '</td></tr>';
         });
         html += '</tbody></table>';
         matchTab.innerHTML = html;

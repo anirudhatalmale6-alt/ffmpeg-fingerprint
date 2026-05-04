@@ -191,8 +191,8 @@ def user_to_pattern(username, num_bits=NUM_BITS):
     return bits
 
 
-def match_user(detected_pattern, users_file=None, users_list=None):
-    """Match detected pattern against user database."""
+def match_user(detected_pattern, users_file=None, users_list=None, min_confidence=70.0):
+    """Match detected pattern against user database using circular offset search."""
     users = []
 
     if users_file:
@@ -207,27 +207,38 @@ def match_user(detected_pattern, users_file=None, users_list=None):
     if not users:
         return None
 
+    num_bits = len(detected_pattern)
     best_match = None
     best_score = -1
+    best_offset = 0
 
     for username in users:
-        expected = user_to_pattern(username, len(detected_pattern))
-        matches = 0
-        total = 0
+        expected = user_to_pattern(username, num_bits)
 
-        for d, e in zip(detected_pattern, expected):
-            if d >= 0:
-                total += 1
-                if d == e:
-                    matches += 1
+        for offset in range(num_bits):
+            matches = 0
+            total = 0
+            for i, d in enumerate(detected_pattern):
+                if d >= 0:
+                    total += 1
+                    e = expected[(i + offset) % num_bits]
+                    if d == e:
+                        matches += 1
 
-        if total > 0:
-            score = matches / total
-            if score > best_score:
-                best_score = score
-                best_match = username
+            if total > 0:
+                score = matches / total
+                if score > best_score:
+                    best_score = score
+                    best_match = username
+                    best_offset = offset
 
-    return {'username': best_match, 'confidence': round(best_score * 100, 1)} if best_match else None
+    if best_match and best_score * 100 >= min_confidence:
+        return {
+            'username': best_match,
+            'confidence': round(best_score * 100, 1),
+            'offset': best_offset
+        }
+    return None
 
 
 def main():
@@ -281,9 +292,9 @@ def main():
     if args.users:
         match = match_user(pattern, users_file=args.users)
         if match:
-            print(f"\nMATCH FOUND: {match['username']} (confidence: {match['confidence']}%)")
+            print(f"\nMATCH FOUND: {match['username']} (confidence: {match['confidence']}%, offset: {match['offset']} segments)")
         else:
-            print("\nNo match found in user database")
+            print("\nNo match found (no user exceeded 70% confidence)")
 
     if args.json:
         output = {
