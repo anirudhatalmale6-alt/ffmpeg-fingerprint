@@ -172,18 +172,20 @@ def analyze_file(filepath):
     num_bits = len(pattern_bits)
 
     from math import comb
-    def compute_min_threshold(valid_bits, pat_len):
+    def compute_min_threshold(valid_bits, pat_len, n_users):
         num_offsets = pat_len
+        total_comparisons = num_offsets * max(n_users, 1)
         if valid_bits < 8:
             return 100.0
-        for tb in range(valid_bits, valid_bits // 2, -1):
+        for tb in range(valid_bits // 2, valid_bits + 1):
             p_single = sum(comb(valid_bits, k) for k in range(tb, valid_bits + 1)) / (2 ** valid_bits)
-            p_any = 1.0 - (1.0 - p_single) ** num_offsets
+            p_any = 1.0 - (1.0 - p_single) ** total_comparisons
             if p_any <= 0.01:
                 return round(tb / valid_bits * 100, 1)
         return 100.0
 
-    min_threshold = compute_min_threshold(detected_count, num_bits)
+    n_users = len(users)
+    min_threshold = compute_min_threshold(detected_count, num_bits, n_users)
 
     for username in users:
         expected = user_to_pattern(username, num_bits)

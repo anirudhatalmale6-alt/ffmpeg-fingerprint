@@ -191,20 +191,20 @@ def user_to_pattern(username, num_bits=NUM_BITS):
     return bits
 
 
-def compute_min_threshold(detected_bits, pattern_len, target_fp_rate=0.01):
+def compute_min_threshold(detected_bits, pattern_len, n_users=1, target_fp_rate=0.01):
     """Compute minimum match threshold to keep false positive rate below target.
 
-    With offset search, we try pattern_len offsets per user. More offsets = higher
-    chance of random match. This adjusts the threshold accordingly.
+    Accounts for both offset search (pattern_len offsets per user) and number
+    of users in the database. More users = more comparisons = higher threshold.
     """
-    from math import comb, log, ceil
-    num_offsets = pattern_len
+    from math import comb
+    total_comparisons = pattern_len * max(n_users, 1)
     if detected_bits < 8:
         return 1.0
-    for threshold_bits in range(detected_bits, detected_bits // 2, -1):
+    for threshold_bits in range(detected_bits // 2, detected_bits + 1):
         p_single = sum(comb(detected_bits, k) for k in range(threshold_bits, detected_bits + 1)) / (2 ** detected_bits)
-        p_any_offset = 1.0 - (1.0 - p_single) ** num_offsets
-        if p_any_offset <= target_fp_rate:
+        p_any = 1.0 - (1.0 - p_single) ** total_comparisons
+        if p_any <= target_fp_rate:
             return threshold_bits / detected_bits
     return 1.0
 
@@ -229,7 +229,7 @@ def match_user(detected_pattern, users_file=None, users_list=None, min_confidenc
     valid_bits = sum(1 for b in detected_pattern if b >= 0)
 
     if min_confidence is None:
-        min_threshold = compute_min_threshold(valid_bits, num_bits)
+        min_threshold = compute_min_threshold(valid_bits, num_bits, len(users))
         min_confidence = min_threshold * 100
     else:
         min_confidence = float(min_confidence)
